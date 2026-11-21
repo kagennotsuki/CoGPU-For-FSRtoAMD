@@ -4,10 +4,8 @@
 #include <condition_variable>
 
 namespace A2In {
-static constexpr UINT kPitch = kNetW * 4;
-static constexpr UINT64 kPlane = UINT64(kPitch) * kNetH;
-static_assert(kPitch % D3D12_TEXTURE_DATA_PITCH_ALIGNMENT == 0 &&
-              kPlane % D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT == 0);
+static inline UINT Pitch() { return kNetW * 4u; }
+static inline UINT64 Plane() { return UINT64(Pitch()) * UINT64(kNetH); }
 struct Key { int frame = -1, gen = -1; UINT64 epoch = 0; };
 static bool Equal(Key a, Key b) { return a.frame == b.frame && a.gen == b.gen && a.epoch == b.epoch; }
 enum State : UINT64 { Free, Recording, Sealed, Calling, Ready, Mirroring, Offered, Leased, Retiring, Dropped, Dead, A3Held };
@@ -105,7 +103,7 @@ static void ReleaseSlotBuffers(Slot& p) {
 static D3D12_TEXTURE_COPY_LOCATION Foot(ID3D12Resource* backing, DXGI_FORMAT fmt, UINT64 offset) {
     D3D12_TEXTURE_COPY_LOCATION l{};
     l.pResource = backing; l.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
-    l.PlacedFootprint = {offset, {fmt, kNetW, kNetH, 1, kPitch}};
+    l.PlacedFootprint = {offset, {fmt, kNetW, kNetH, 1, Pitch()}};
     return l;
 }
 static D3D12_TEXTURE_COPY_LOCATION Tex(ID3D12Resource* t) {
@@ -116,7 +114,7 @@ static void RecordWorkerCopies(ID3D12GraphicsCommandList* cl, ID3D12Resource* so
                                ID3D12Resource* color, ID3D12Resource* mv,
                                D3D12_RESOURCE_STATES colorState, D3D12_RESOURCE_STATES mvState) {
     auto cs = Foot(source, DXGI_FORMAT_R8G8B8A8_UNORM, 0);
-    auto vs = Foot(source, DXGI_FORMAT_R16G16_FLOAT, kPlane);
+    auto vs = Foot(source, DXGI_FORMAT_R16G16_FLOAT, Plane());
     auto cd = Tex(color), vd = Tex(mv);
     F9Id::Transition(cl, source, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE);
     F9Id::Transition(cl, color, colorState, D3D12_RESOURCE_STATE_COPY_DEST);
@@ -146,6 +144,16 @@ static bool Cancel(Token t) {
     auto g = t.slot->gate.load();
     if (Seq(g) != t.seq || S(g) != Offered || !Move(*t.slot, g, Dropped)) return false;
     Reject(t); ++stale; return true;
+}
+static void ResetAll() {
+    for (auto& s : slots) {
+        ReleaseSlotBuffers(s);
+        s.key = {}; s.seq = 0; s.retire = 0; s.sealTick = 0; s.a3 = false;
+        s.gate.store(Free);
+    }
+    for (auto& r : rejected) r.store(0);
+    a3WriteCursor = 0; watched.store(0); broken.store(0);
+    initialized.store(false); initAttempted = false;
 }
 struct Lease {
     Token t;
@@ -193,11 +201,12 @@ struct Lease {
     }
 };
 static bool StampMatches(Slot& p) {
-    const D3D12_RANGE range{SIZE_T(kPlane), SIZE_T(kPlane + sizeof(F9Id::Stamp))};
+    const UINT64 pl = Plane();
+    const D3D12_RANGE range{SIZE_T(pl), SIZE_T(pl + sizeof(F9Id::Stamp))};
     void* ptr = nullptr;
     if (FAILED(p.mirror->Map(0, &range, &ptr)) || !ptr) { ++mirrorFail; return false; }
     F9Id::Stamp stamp{};
-    memcpy(&stamp, static_cast<const BYTE*>(ptr) + kPlane, sizeof(stamp));
+    memcpy(&stamp, static_cast<const BYTE*>(ptr) + pl, sizeof(stamp));
     const D3D12_RANGE none{}; p.mirror->Unmap(0, &none);
     return stamp == F9Id::Stamp{p.seq, p.seq ^ 0x91b5714fac4e78c9ull};
 }
@@ -272,7 +281,8 @@ static void DiagReap(Slot& p, int dispatch, UINT64 a, UINT64 w, UINT64 worker, S
 }
 
 static Token Offer(Key key, BYTE* rgb, size_t rgbBytes, int dispatch = -1) {
-    if (!initialized.load() || broken.load() || !rgb || rgbBytes != kPlane) {
+    const UINT64 pl = Plane();
+    if (!initialized.load() || broken.load() || !rgb || rgbBytes != pl) {
         DiagOfferNone(key, dispatch, "lane_or_mirror_unavailable");
         return {};
     }
@@ -288,15 +298,15 @@ static Token Offer(Key key, BYTE* rgb, size_t rgbBytes, int dispatch = -1) {
             Move(p, p.gate.load(), Dead);
             return {};
         }
-        const D3D12_RANGE range{0, SIZE_T(kPlane + sizeof(F9Id::Stamp))};
+        const D3D12_RANGE range{0, SIZE_T(pl + sizeof(F9Id::Stamp))};
         void* ptr = nullptr;
         if (FAILED(p.mirror->Map(0, &range, &ptr)) || !ptr) {
             ++mirrorFail; Move(p, p.gate.load(), Dead); Break(4); return {};
         }
         const auto* pixels = static_cast<const BYTE*>(ptr);
-        F9Id::Stamp stamp{}; memcpy(&stamp, pixels + kPlane, sizeof(stamp));
+        F9Id::Stamp stamp{}; memcpy(&stamp, pixels + pl, sizeof(stamp));
         const bool ok = stamp == F9Id::Stamp{p.seq, p.seq ^ 0x91b5714fac4e78c9ull};
-        if (ok && !(p.gate.load() & kFault) && !broken.load()) memcpy(rgb, pixels, size_t(kPlane));
+        if (ok && !(p.gate.load() & kFault) && !broken.load()) memcpy(rgb, pixels, size_t(pl));
         const D3D12_RANGE none{}; p.mirror->Unmap(0, &none);
         if (!ok || (p.gate.load() & kFault) || broken.load()) {
             ++mirrorFail; Move(p, p.gate.load(), Dead); Break(4); return {};
@@ -460,15 +470,16 @@ struct Producer {
         // Sources already COPY_SOURCE; neither data nor marker can be published
         // separately. This list also records the local color/MV capture.
         auto srcC = Tex(color), srcM = Tex(mv);
+        const UINT64 pl = Plane();
         auto dc = Foot(p->bufA.Get(), DXGI_FORMAT_R8G8B8A8_UNORM, 0);
-        auto dm = Foot(p->bufA.Get(), DXGI_FORMAT_R16G16_FLOAT, kPlane);
+        auto dm = Foot(p->bufA.Get(), DXGI_FORMAT_R16G16_FLOAT, pl);
         auto cpu = Foot(p->mirror.Get(), DXGI_FORMAT_R8G8B8A8_UNORM, 0);
         F9Id::Transition(cl, p->bufA.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST);
         cl->CopyTextureRegion(&dc, 0, 0, 0, &srcC, nullptr);
         cl->CopyTextureRegion(&dm, 0, 0, 0, &srcM, nullptr);
         F9Id::Transition(cl, p->bufA.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON);
         cl->CopyTextureRegion(&cpu, 0, 0, 0, &srcC, nullptr);
-        cl->CopyBufferRegion(p->mirror.Get(), kPlane, p->marker.Get(), 0, sizeof(F9Id::Stamp));
+        cl->CopyBufferRegion(p->mirror.Get(), pl, p->marker.Get(), 0, sizeof(F9Id::Stamp));
         p->sealTick = GetTickCount64();
         if (p->a3) a3WriteCursor = (UINT(p - slots) + 1u) % kSlots;
         ++watched;

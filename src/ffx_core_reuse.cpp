@@ -57,7 +57,7 @@ static bool g_disabled = false;
 static ComPtr<ID3D12Resource> g_fedTex[8];   // ≥ K（K 上限 8）
 // （SRV 槽位映射见 K 声明之后的 kSrv* 常量）
 static ComPtr<ID3D12Resource> g_ansLocal;      // S5-4：本地中转 buffer（跨卡 buffer 不能建 SRV）
-static const UINT64 ANS_BYTES = 1920ull * 1080ull * 4ull;
+static inline UINT64 AnsBytes();             // 随 kNetW × kNetH 动态计算
 static volatile bool g_useGpuResid = true;   // S5-5：残差改用 GPU 计算（读本地中转 buffer）
 static ComPtr<ID3D12Heap> g_xHeapIn, g_xHeapOut, g_xHeapInW, g_xHeapOutW;
 static ComPtr<ID3D12Resource> g_xBufIn, g_xBufOut, g_xBufInW, g_xBufOutW;
@@ -374,7 +374,30 @@ struct Capabilities {   // LmxxfNrCapabilities
     uint32_t history_supported, overlap_supported, graph_supported, hip_ready, gfx1201_target;
 };
 
-static const UINT kNetW = 1920, kNetH = 1080;
+static UINT kNetW = 1920, kNetH = 1080;
+static inline UINT64 AnsBytes() { return (UINT64)kNetW * (UINT64)kNetH * 4ull; }
+static volatile int  g_nrScaleMode = 0;      // 0=1080p, 1=50%, 2=67%, 3=75%, 4=100%, 5=720p, 6=900p, 7=1440p
+static std::atomic<bool> g_netRebuilding{false};
+static void ComputeNetDims(int mode, UINT refW, UINT refH, UINT& outW, UINT& outH) {
+    switch (mode) {
+    case 5: outW = 1280; outH = 720; return;
+    case 6: outW = 1600; outH = 900; return;
+    case 7: outW = 2560; outH = 1440; return;
+    case 1: case 2: case 3: case 4: {
+        if (refW < 320 || refH < 180) { refW = 1920; refH = 1080; }
+        static const float kPct[4] = { 0.50f, 0.6667f, 0.75f, 1.00f };
+        float sc = kPct[mode - 1];
+        UINT rw = (UINT)lroundf((float)refW * sc);
+        UINT rh = (UINT)lroundf((float)refH * sc);
+        rw = ((rw + 32u) / 64u) * 64u;
+        rh = ((rh + 4u) / 8u) * 8u;
+        if (rw < 640u)  rw = 640u;  if (rw > 2560u) rw = 2560u;
+        if (rh < 360u)  rh = 360u;  if (rh > 1440u) rh = 1440u;
+        outW = rw; outH = rh; return;
+    }
+    default: outW = 1920; outH = 1080; return;
+    }
+}
 // FP16 → float（底图行探针用）
 static inline float HalfToFloat(uint16_t h) {
     uint32_t s = (h >> 15) & 1u, e = (h >> 10) & 0x1Fu, m = h & 0x3FFu;
@@ -488,6 +511,8 @@ struct A1HistoryReset {
 };
 struct Worker {
     std::thread th; std::mutex m; std::condition_variable cv; std::condition_variable cvOut;
+    std::condition_variable pausedCv;
+    bool pauseReq = false, pausedAck = false;
     std::vector<uint8_t> inBuf, outBuf;
     bool hasIn = false, hasOut = false, quit = false;
     int inIndex = -1, outIndex = -1;
@@ -540,6 +565,11 @@ struct Worker {
     bool isMochi = false;       // 后端身份：mochizuki / lmxxf 系
     int  modelApplied = -1;     // 当前会话对应哪个模型请求（1=Original, 0=Small）
     void* setControls = nullptr;   // MochizukiNrSetControls（不在 ApiTable 里，单独 GetProcAddress）
+    D3D12_RESOURCE_STATES ngxColState = D3D12_RESOURCE_STATE_COMMON;
+    D3D12_RESOURCE_STATES ngxMvState  = D3D12_RESOURCE_STATE_COMMON;
+    ComPtr<ID3D12Resource> bMvZeroUp;
+    UINT ngxMvDimW = 0, ngxMvDimH = 0;
+    float ngxMvX = 1920.0f, ngxMvY = 1080.0f;
 };
 static Worker g_worker;
 static char g_statusLine[256] = { 0 };   // 运行时自报状态（GetStatus），菜单里显示
@@ -697,6 +727,53 @@ static ComPtr<ID3D12Resource> MakeTex(ID3D12Device* dev, UINT w, UINT h, DXGI_FO
 static bool WorkerCreateSession();   // 前向声明（WorkerInit 里调用；定义在 WorkerInit 之后）
 
 static unsigned int g_wantDevId = 0;   // 安装器指定的神经卡 DeviceId（0=未指定）
+static bool WorkerAllocNetResources() {
+    Worker& W = g_worker;
+    if (!W.dev) return false;
+    D3D12_HEAP_PROPERTIES dh{};
+    dh.Type = D3D12_HEAP_TYPE_DEFAULT;
+    dh.CPUPageProperty = D3D12_CPU_PAGE_PROPERTY_UNKNOWN;
+    dh.MemoryPoolPreference = D3D12_MEMORY_POOL_UNKNOWN;
+    dh.CreationNodeMask = 1; dh.VisibleNodeMask = 1;
+    D3D12_HEAP_PROPERTIES uh = dh; uh.Type = D3D12_HEAP_TYPE_UPLOAD;
+
+    // mochizuki 是 Vulkan 后端：它要把我们给的 D3D12 纹理导入 Vulkan（CreateSharedHandle），
+    // 所以这张输入纹理必须带 D3D12_HEAP_FLAG_SHARED；否则导入失败、首帧就卡住（本机实测现象）。
+    W.color = MakeTex(W.dev.Get(), kNetW, kNetH, DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_STATE_COMMON, false, true);
+    if (g_backendNgx) {
+        W.vel = MakeTex(W.dev.Get(), kNetW, kNetH, DXGI_FORMAT_R16G16_FLOAT, D3D12_RESOURCE_STATE_COMMON, false, true);
+        Log("worker: MV texture (%ux%u RG16F shared) %s", kNetW, kNetH, W.vel ? "ready" : "FAILED -> MV not fed");
+    }
+    if (!W.color) { Log("worker: 纹理失败"); return false; }
+    D3D12_RESOURCE_DESC cd = W.color->GetDesc();
+    D3D12_RESOURCE_DESC plain = cd; plain.Flags = D3D12_RESOURCE_FLAG_NONE;
+    UINT rows = 0; UINT64 rs = 0, total = 0;
+    W.dev->GetCopyableFootprints(&plain, 0, 1, 0, &W.fp, &rows, &rs, &total);
+    W.bytes = total;
+
+    D3D12_RESOURCE_DESC bd{};
+    bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    bd.Width = W.bytes; bd.Height = 1; bd.DepthOrArraySize = 1; bd.MipLevels = 1;
+    bd.Format = DXGI_FORMAT_UNKNOWN; bd.SampleDesc.Count = 1;
+    bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    W.up.Reset(); W.upPtr = nullptr;
+    W.dev->CreateCommittedResource(&uh, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(W.up.GetAddressOf()));
+    {
+        D3D12_RANGE zr{ 0, 0 };
+        if (W.up && SUCCEEDED(W.up->Map(0, &zr, &W.upPtr)) && W.upPtr) Log("worker: 上传缓冲持久映射 ok (%ux%u, %llu B)", kNetW, kNetH, (unsigned long long)W.bytes);
+    }
+    W.inBuf.assign((size_t)W.bytes, 0);
+    W.outBuf.assign((size_t)W.bytes, 0);
+    W.ansBuf.assign(K, std::vector<uint8_t>((size_t)kNetW * kNetH * 4, 0));
+    W.ansFrame.assign(K, -1);
+    W.ansAGen.assign(K, -1);
+    W.ngxColState = D3D12_RESOURCE_STATE_COMMON;
+    W.ngxMvState  = D3D12_RESOURCE_STATE_COMMON;
+    W.bMvZeroUp.Reset();
+    W.ngxMvDimW = W.ngxMvDimH = 0;
+    return true;
+}
+
 static bool WorkerInit() {
     Worker& W = g_worker;
     ComPtr<IDXGIFactory6> fac;
@@ -779,40 +856,8 @@ static bool WorkerInit() {
     if (!W.a3WakeEvent) W.a3WakeEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
     A2In::a3WakeEvent.store(W.a3WakeEvent, std::memory_order_release);
 
-    D3D12_HEAP_PROPERTIES dh{};
-    dh.Type = D3D12_HEAP_TYPE_DEFAULT;
-    dh.CPUPageProperty = D3D12_CPU_PAGE_PROPERTY_UNKNOWN;
-    dh.MemoryPoolPreference = D3D12_MEMORY_POOL_UNKNOWN;
-    dh.CreationNodeMask = 1; dh.VisibleNodeMask = 1;
-    D3D12_HEAP_PROPERTIES uh = dh; uh.Type = D3D12_HEAP_TYPE_UPLOAD;
-    D3D12_HEAP_PROPERTIES rh = dh; rh.Type = D3D12_HEAP_TYPE_READBACK;
-
-    // mochizuki 是 Vulkan 后端：它要把我们给的 D3D12 纹理导入 Vulkan（CreateSharedHandle），
-    // 所以这张输入纹理必须带 D3D12_HEAP_FLAG_SHARED；否则导入失败、首帧就卡住（本机实测现象）。
-    W.color = MakeTex(W.dev.Get(), kNetW, kNetH, DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_STATE_COMMON, false, true);
-    if (g_backendNgx) {
-        W.vel = MakeTex(W.dev.Get(), kNetW, kNetH, DXGI_FORMAT_R16G16_FLOAT, D3D12_RESOURCE_STATE_COMMON, false, true);
-        Log("worker: MV texture (1080p RG16F shared) %s", W.vel ? "ready" : "FAILED -> MV not fed");
-    }
-    if (!W.color) { Log("worker: 纹理失败"); return false; }
-    D3D12_RESOURCE_DESC cd = W.color->GetDesc();
-    D3D12_RESOURCE_DESC plain = cd; plain.Flags = D3D12_RESOURCE_FLAG_NONE;
-    UINT rows = 0; UINT64 rs = 0, total = 0;
-    W.dev->GetCopyableFootprints(&plain, 0, 1, 0, &W.fp, &rows, &rs, &total);
-    W.bytes = total;
-
-    D3D12_RESOURCE_DESC bd{};
-    bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-    bd.Width = W.bytes; bd.Height = 1; bd.DepthOrArraySize = 1; bd.MipLevels = 1;
-    bd.Format = DXGI_FORMAT_UNKNOWN; bd.SampleDesc.Count = 1;
-    bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
-    W.dev->CreateCommittedResource(&uh, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(W.up.GetAddressOf()));
-    {
-        D3D12_RANGE zr{ 0, 0 };
-        if (SUCCEEDED(W.up->Map(0, &zr, &W.upPtr)) && W.upPtr) Log("worker: 上传缓冲持久映射 ok");
-    }
-    W.inBuf.assign((size_t)W.bytes, 0);
-    W.outBuf.assign((size_t)W.bytes, 0);
+    // mochizuki 是 Vulkan 后端：输入纹理与上传缓冲统一由 WorkerAllocNetResources() 按 kNetW×kNetH 创建
+    if (!WorkerAllocNetResources()) return false;
 
     std::string dir = ModuleDir();
     std::wstring pak(dir.begin(), dir.end()); pak += L"LmxxfNrRuntime.pak";
@@ -1855,12 +1900,14 @@ static void WorkerMain() {
         A2In::Token a2Token;
         A3::Work a3;
         for (;;) {
-            bool haveJob = false, checkA3 = false;
+            bool needPause = false, haveJob = false, checkA3 = false;
             {
                 std::unique_lock<std::mutex> lk(W.m);
-                if (!a3PendingCheck) W.cv.wait(lk, [&] { return W.quit || W.hasIn; });
+                if (!W.pauseReq && !a3PendingCheck) W.cv.wait(lk, [&] { return W.quit || W.pauseReq || W.hasIn; });
                 if (W.quit) break;
-                if (W.hasIn) {
+                if (W.pauseReq) {
+                    needPause = true;
+                } else if (W.hasIn) {
                     feedHasAPixels = W.inHasAPixels;
                     feedAGen = W.inAGen;
                     f9Dispatch = W.f9Dispatch;
@@ -1886,6 +1933,18 @@ static void WorkerMain() {
                     }
                 }
                 a3PendingCheck = false;
+            }
+            if (needPause) {
+                if (W.fv) WaitWFence(W.fv, 2000);
+                std::unique_lock<std::mutex> lk(W.m);
+                W.pausedAck = true;
+                W.hasIn = false; W.inA2 = {}; W.inA3 = false;
+                a3PendingCheck = false; lastEvaluatedAGen = -1; lastA3Gen = -1;
+                W.pausedCv.notify_all();
+                W.cv.wait(lk, [&] { return W.quit || !W.pauseReq; });
+                W.pausedAck = false;
+                if (W.quit) break;
+                continue;
             }
             if (haveJob) break;
             if (!checkA3) continue;
@@ -1931,8 +1990,6 @@ static void WorkerMain() {
         //   1) the answer texture carries ALLOW_UNORDERED_ACCESS (created in ngx_f18_backend.cpp)
         //   2) the answer is read ONE submission LATER (reading right after Evaluate gives garbage)
         //   3) the core leaves the answer in UNORDERED_ACCESS, our barriers account for that
-        static D3D12_RESOURCE_STATES sNgxColState = D3D12_RESOURCE_STATE_COMMON;   // what the core left W.color in
-        static D3D12_RESOURCE_STATES sNgxMvState  = D3D12_RESOURCE_STATE_COMMON;   // what the core left W.vel in
         if (g_backendNgx) {
             ID3D12Resource* po = nullptr;
             const UINT uiEpoch = g_bformOn ? BformUiEpoch() : 0;
@@ -2022,7 +2079,8 @@ static void WorkerMain() {
                 //   ★ 相位/数字必须用【该槽真正属于的帧号】g_slotTag[..].frame，不能用槽号：
                 //     槽号只有 0..5 循环（且 g_upLastSlot 在 xferOwn 路径下由 XferKickColor 发布），
                 //     用它当相位会出现"条一直落在第一格不动"（2026-10-31 实测踩到）。
-                if (decOk && decSlot >= 0 && *(int*)&g_marqueeOn == 1) {
+                // B 形态已关闭 F7 跑马灯标记，保持与 A 形态一致（仅保留纯净真实画面）
+                if (false && decOk && decSlot >= 0 && *(int*)&g_marqueeOn == 1) {
                     // 面单由 XferKickColor 在【颜色拷贝成功后】发布（:4768），所以这个帧号是可信的；
                     // 还没发布过（=0）就本轮不画，等它发布。
                     int mf = (int)g_slotTag[decSlot].frame;
@@ -2031,13 +2089,13 @@ static void WorkerMain() {
                 if (decOk && g_bTexC) {
                     // W.color 上一帧可能被核心留在 SRV 态（sampled in place），先摆回 COMMON；
                     // 降采样内部对它不做状态转换（沿用 B 形态原约定），所以必须由我们摆好。
-                    Barrier(W.cl.Get(), W.color.Get(), sNgxColState, D3D12_RESOURCE_STATE_COMMON);
+                    Barrier(W.cl.Get(), W.color.Get(), W.ngxColState, D3D12_RESOURCE_STATE_COMMON);
                     if (BformBDownsample(W.cl.Get(), W.color.Get())) {
-                        sNgxColState = D3D12_RESOURCE_STATE_COMMON;
+                        W.ngxColState = D3D12_RESOURCE_STATE_COMMON;
                         bPrep = true;
                     }
                 }
-                // MV：g_bTexM（槽位解出的 1080p RG16F，普通纹理）→ W.vel（shared：核心要 import 到 Vulkan）
+                // MV：g_bTexM（槽位解出的 RG16F，普通纹理）→ W.vel（shared：核心要 import 到 Vulkan）
                 // r28 块4：若 s.mvOk==0，跳过 BformSlotMvToShared；HIT-3：改为把 W.vel 清零（upload 零拷贝），让 NGX 走"无运动"假设
                 bMvOk = false;
                 {
@@ -2045,15 +2103,14 @@ static void WorkerMain() {
                     if (!mvOkSlot) InterlockedIncrement(&g_r28CntMvOkZero);
                     if (bPrep && W.vel) {
                         if (mvOkSlot) {
-                            if (BformSlotMvToShared(W.cl.Get(), W.vel.Get(), sNgxMvState)) {
-                                sNgxMvState = D3D12_RESOURCE_STATE_COMMON;
+                            if (BformSlotMvToShared(W.cl.Get(), W.vel.Get(), W.ngxMvState)) {
+                                W.ngxMvState = D3D12_RESOURCE_STATE_COMMON;
                                 bMvOk = true;
                             }
                         } else {
                             // HIT-3：mvOk=0 → 喂零 MV（upload heap 零拷贝，不需要 UAV）
-                            static ComPtr<ID3D12Resource> g_bMvZeroUp;
                             const UINT mvZeroPitch = ((UINT)kNetW * 4u + 255u) & ~255u;
-                            if (!g_bMvZeroUp && W.dev) {
+                            if (!W.bMvZeroUp && W.dev) {
                                 D3D12_HEAP_PROPERTIES hp{}; hp.Type = D3D12_HEAP_TYPE_UPLOAD;
                                 D3D12_RESOURCE_DESC bd{};
                                 bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
@@ -2069,17 +2126,17 @@ static void WorkerMain() {
                                         memset(p, 0, (size_t)bd.Width);
                                         up->Unmap(0, nullptr);
                                     }
-                                    g_bMvZeroUp = std::move(up);
+                                    W.bMvZeroUp = std::move(up);
                                     Log("R28B4-HIT3: 零MV upload buffer 就绪（%dx%d pitch=%u）", kNetW, kNetH, mvZeroPitch);
                                 }
                             }
-                            if (g_bMvZeroUp) {
+                            if (W.bMvZeroUp) {
                                 D3D12_TEXTURE_COPY_LOCATION vd{};
                                 vd.pResource = W.vel.Get();
                                 vd.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
                                 vd.SubresourceIndex = 0;
                                 D3D12_TEXTURE_COPY_LOCATION vs{};
-                                vs.pResource = g_bMvZeroUp.Get();
+                                vs.pResource = W.bMvZeroUp.Get();
                                 vs.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
                                 vs.PlacedFootprint.Offset = 0;
                                 vs.PlacedFootprint.Footprint.Format    = DXGI_FORMAT_R16G16_FLOAT;
@@ -2087,10 +2144,10 @@ static void WorkerMain() {
                                 vs.PlacedFootprint.Footprint.Height    = (UINT)kNetH;
                                 vs.PlacedFootprint.Footprint.Depth     = 1;
                                 vs.PlacedFootprint.Footprint.RowPitch  = mvZeroPitch;
-                                Barrier(W.cl.Get(), W.vel.Get(), sNgxMvState, D3D12_RESOURCE_STATE_COPY_DEST);
+                                Barrier(W.cl.Get(), W.vel.Get(), W.ngxMvState, D3D12_RESOURCE_STATE_COPY_DEST);
                                 W.cl->CopyTextureRegion(&vd, 0, 0, 0, &vs, nullptr);
                                 Barrier(W.cl.Get(), W.vel.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON);
-                                sNgxMvState = D3D12_RESOURCE_STATE_COMMON;
+                                W.ngxMvState = D3D12_RESOURCE_STATE_COMMON;
                             }
                         }
                     }
@@ -2112,8 +2169,8 @@ static void WorkerMain() {
             F9Id::Path f9ColorPath = F9Id::NoInputCopy, f9MvPath = F9Id::NoInputCopy;
             if (a2Source) {
                 A2In::RecordWorkerCopies(W.cl.Get(), a2Source, W.color.Get(), W.vel.Get(),
-                                         sNgxColState, sNgxMvState);
-                sNgxColState = sNgxMvState = D3D12_RESOURCE_STATE_COMMON;
+                                         W.ngxColState, W.ngxMvState);
+                W.ngxColState = W.ngxMvState = D3D12_RESOURCE_STATE_COMMON;
                 f9ColorPath = f9MvPath = F9Id::A2Pair;
             } else if (useAInput) {
                 D3D12_TEXTURE_COPY_LOCATION cd{};
@@ -2131,23 +2188,23 @@ static void WorkerMain() {
                     cs.PlacedFootprint.Footprint.Height = kNetH;
                     cs.PlacedFootprint.Footprint.Depth = 1;
                     cs.PlacedFootprint.Footprint.RowPitch = kNetW * 4;
-                    Barrier(W.cl.Get(), W.color.Get(), sNgxColState, D3D12_RESOURCE_STATE_COPY_DEST);
+                    Barrier(W.cl.Get(), W.color.Get(), W.ngxColState, D3D12_RESOURCE_STATE_COPY_DEST);
                     W.cl->CopyTextureRegion(&cd, 0, 0, 0, &cs, nullptr);
                     Barrier(W.cl.Get(), W.color.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON);
-                    sNgxColState = D3D12_RESOURCE_STATE_COMMON;
+                    W.ngxColState = D3D12_RESOURCE_STATE_COMMON;
                 } else if (W.up) {
                     f9ColorPath = F9Id::CpuUpload;
                     D3D12_TEXTURE_COPY_LOCATION cs{};
                     cs.pResource = W.up.Get();
                     cs.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
                     cs.PlacedFootprint = W.fp;
-                    Barrier(W.cl.Get(), W.color.Get(), sNgxColState, D3D12_RESOURCE_STATE_COPY_DEST);
+                    Barrier(W.cl.Get(), W.color.Get(), W.ngxColState, D3D12_RESOURCE_STATE_COPY_DEST);
                     W.cl->CopyTextureRegion(&cd, 0, 0, 0, &cs, nullptr);
                     Barrier(W.cl.Get(), W.color.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON);
-                    sNgxColState = D3D12_RESOURCE_STATE_COMMON;
+                    W.ngxColState = D3D12_RESOURCE_STATE_COMMON;
                 }
             }
-            // MV: cross-card buffer -> this card's 1080p RG16F texture (shared, the core samples it in place)
+            // MV: cross-card buffer -> this card's net RG16F texture (shared, the core samples it in place)
             if (useAInput && !a2Source && W.vel && g_xBufVelW) {
                 f9MvPath = F9Id::Shared;
                 D3D12_TEXTURE_COPY_LOCATION vd{};
@@ -2163,29 +2220,24 @@ static void WorkerMain() {
                 vs.PlacedFootprint.Footprint.Height = kNetH;
                 vs.PlacedFootprint.Footprint.Depth = 1;
                 vs.PlacedFootprint.Footprint.RowPitch = kNetW * 4;
-                Barrier(W.cl.Get(), W.vel.Get(), sNgxMvState, D3D12_RESOURCE_STATE_COPY_DEST);
+                Barrier(W.cl.Get(), W.vel.Get(), W.ngxMvState, D3D12_RESOURCE_STATE_COPY_DEST);
                 W.cl->CopyTextureRegion(&vd, 0, 0, 0, &vs, nullptr);
                 Barrier(W.cl.Get(), W.vel.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON);
-                sNgxMvState = D3D12_RESOURCE_STATE_COMMON;
+                W.ngxMvState = D3D12_RESOURCE_STATE_COMMON;
             }
             const bool ensureOk = !holdNoNew && NgxBackendEnsure(W.cl.Get(), kNetW, kNetH);
-            // MV scale for the core: our packed MV is normalised (pixel = value x W/2), so UV = value x 0.5.
-            // xess_proxy.mvscale.txt overrides it (one float; sign included) so it can be tuned without a rebuild.
-            static float sNgxMvX = 12345.0f, sNgxMvY = 12345.0f;   // per-axis: pixels per MV unit
-            if (sNgxMvX > 9000.0f) {
-                // The game MV is normalised by the FULL frame (1.0 = whole width/height), so
-                // pixels-in-model-space = mv * W (and mv * H for Y). Taken from the core's own fit:
-                // passing W/2 left a consistent 2.0x shortfall in X.
-                sNgxMvX = (float)kNetW;
-                sNgxMvY = (float)kNetH;
+            if (W.ngxMvDimW != kNetW || W.ngxMvDimH != kNetH) {
+                W.ngxMvDimW = kNetW; W.ngxMvDimH = kNetH;
+                W.ngxMvX = (float)kNetW;
+                W.ngxMvY = (float)kNetH;
                 std::string fp = ModuleDir() + "xess_proxy.mvscale.txt";
                 FILE* mf = nullptr; float ax = 0.0f, ay = 0.0f;
                 if (fopen_s(&mf, fp.c_str(), "r") == 0 && mf) {
                     const int n = fscanf_s(mf, "%f %f", &ax, &ay);
-                    if (n >= 1) { sNgxMvX = ax; sNgxMvY = (n >= 2) ? ay : ax; }
+                    if (n >= 1) { W.ngxMvX = ax; W.ngxMvY = (n >= 2) ? ay : ax; }
                     fclose(mf);
                 }
-                Log("NGX: MV scale = %.4f, %.4f px/MV-unit（xess_proxy.mvscale.txt 可写两个数覆盖）", sNgxMvX, sNgxMvY);
+                Log("NGX: MV scale = %.4f, %.4f px/MV-unit（xess_proxy.mvscale.txt 可写两个数覆盖）", W.ngxMvX, W.ngxMvY);
             }
             // The NGX pixel scales above are independent of residual reprojection's UV scale.
             // r28 NO_NEW 不执行 Eval；没有 B 准备结果、也没有 A 输入的唤醒同样不执行。
@@ -2204,8 +2256,8 @@ static void WorkerMain() {
             F9Id::WRecord f9Eval(W.cl.Get(), W.dev.Get(), f9Dispatch, feedAGen, feedAResetEpoch);
             if (f9Eval.part && freshA && !skipEval && ensureOk) {
                 const auto audit = a3.a ? A3::Audit(*a3.a) : F9Id::A3Meta{};
-                f9Eval.Tap(F9Id::WColor, W.color.Get(), sNgxColState, frameId, frameId, f9ColorPath, audit);
-                if (W.vel) f9Eval.Tap(F9Id::WMv, W.vel.Get(), sNgxMvState, frameId,
+                f9Eval.Tap(F9Id::WColor, W.color.Get(), W.ngxColState, frameId, frameId, f9ColorPath, audit);
+                if (W.vel) f9Eval.Tap(F9Id::WMv, W.vel.Get(), W.ngxMvState, frameId,
                                       a2Source ? frameId : frameId + 1, f9MvPath, audit);
                 else F9Id::Count(F9Id::WMv, F9Id::NotProduced);
             } else if (f9Eval.part && feedHasAPixels && !bPrep) {
@@ -2214,10 +2266,10 @@ static void WorkerMain() {
             }
             const bool evalOk = !skipEval && ensureOk && NgxBackendEval(W.cl.Get(), W.color.Get(), W.vel.Get(),
                                                            kNetW, kNetH, W.processed < 3 || resetA || resetReasons != 0,
-                                                           sNgxMvX, sNgxMvY);
+                                                           W.ngxMvX, W.ngxMvY);
             if (evalOk) {   // the core samples colour/MV in place and leaves them shader-readable
-                sNgxColState = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
-                sNgxMvState  = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+                W.ngxColState = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+                W.ngxMvState  = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
             }
             BtTrace("BPREP_END", frameId, "prep",
                     "iter=%ld b_on=%d attempted=%d color_recorded=%d mv_recorded=%d ensure=%d eval=%d",
@@ -2398,8 +2450,8 @@ static void WorkerMain() {
                         break;
                     }
                     Barrier(W.cl.Get(), po, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON);
-                    const bool recorded = (*(int*)&g_triOn == 1) ? BformBTri(W.cl.Get(), po, slot)
-                                                                 : BformBCompose(W.cl.Get(), po, slot);
+                    // B 形态已关闭 F8 三横带诊断，直接走正常 BformBCompose 合成
+                    const bool recorded = BformBCompose(W.cl.Get(), po, slot);
                     const bool upRecorded = recorded && upscale && BformBUpscale(W.cl.Get(), slot);
                     if (recorded) BformDiagEnqueue(W, po, slot, upRecorded);
                     Barrier(W.cl.Get(), po, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
@@ -2926,6 +2978,7 @@ struct Params {
     bool  ppOn;
     int   ppExpMode, ppCurve;
     float ppBias, ppContrast, ppSat;
+    int   nrScaleMode;
 };
 static Params g_sessionStart{};
 static bool   g_sessionStartValid = false;
@@ -2945,6 +2998,7 @@ static Params CaptureParams() {
     p.mirrorOn = g_mirOn;
     p.ppOn = g_ppOn; p.ppExpMode = g_ppExpMode; p.ppBias = g_ppBias;
     p.ppCurve = g_ppCurve; p.ppContrast = g_ppContrast; p.ppSat = g_ppSat;
+    p.nrScaleMode = g_nrScaleMode;
     return p;
 }
 static void ApplyParams(const Params& p) {
@@ -2966,6 +3020,7 @@ static void ApplyParams(const Params& p) {
     g_ppCurve = p.ppCurve; g_ppContrast = p.ppContrast; g_ppSat = p.ppSat;
     g_ppLoaded = true;
     if (ppChanged) SavePreprocessToIni();
+    g_nrScaleMode = (p.nrScaleMode >= 0 && p.nrScaleMode <= 7) ? p.nrScaleMode : 0;
     g_ctrlDirty = true;
 }
 static Params FactoryParams() {
@@ -2981,6 +3036,7 @@ static Params FactoryParams() {
     p.mirrorOn = false;
     p.ppOn = true; p.ppExpMode = 1; p.ppBias = 0.0f;
     p.ppCurve = 3; p.ppContrast = 1.0f; p.ppSat = 1.0f;
+    p.nrScaleMode = 0;
     return p;
 }
 static bool SaveParamsToFile(const Params& p) {
@@ -3000,6 +3056,7 @@ static bool SaveParamsToFile(const Params& p) {
     fprintf(f, "mirror=%d\n", (int)p.mirrorOn);
     fprintf(f, "pp_enabled=%d\npp_exposure=%d\npp_bias=%.6f\npp_curve=%d\npp_contrast=%.6f\npp_saturation=%.6f\n",
             (int)p.ppOn, p.ppExpMode, p.ppBias, p.ppCurve, p.ppContrast, p.ppSat);
+    fprintf(f, "nr_scale_mode=%d\n", p.nrScaleMode);
     fclose(f);
     Log("菜单: 已保存设置 → %s", path.c_str());
     return true;
@@ -3051,6 +3108,7 @@ static bool LoadParamsFromFile(Params& p) {   // 只覆盖文件里出现的键
         else if (!strcmp(k, "pp_curve")) p.ppCurve = (iv >= 0 && iv < 7) ? iv : 3;
         else if (!strcmp(k, "pp_contrast")) p.ppContrast = fv;
         else if (!strcmp(k, "pp_saturation")) p.ppSat = fv;
+        else if (!strcmp(k, "nr_scale_mode")) p.nrScaleMode = (iv >= 0 && iv <= 7) ? iv : 0;
         else continue;
         ++n;
     }
@@ -3195,8 +3253,9 @@ void TriCS(uint3 id : SV_DispatchThreadID)
     if (id.x>=w||id.y>=h) return;
     float2 uv = (float2(id.xy)+0.5)/float2(w,h);
     float  fy = float(id.y)/float(h);
-    int2   n  = int2(clamp(uv*float2(1920.0,1080.0), float2(0.5,0.5), float2(1919.5,1079.5)));
-    float3 a  = gAns[n.y*1920+n.x].rgb;        // 答案（1080p buffer）
+    uint nw, nh; gFed.GetDimensions(nw, nh);
+    int2   n  = int2(clamp(uv * float2(nw, nh), float2(0.5, 0.5), float2(float(nw) - 0.5, float(nh) - 0.5)));
+    float3 a  = gAns[n.y * nw + n.x].rgb;        // 答案（网络尺寸 buffer）
     float3 f  = gFed.Load(int3(n,0)).rgb;      // 该槽位的喂入图
     float3 e  = a - f;                         // 残差
     float el = dot(e, float3(0.2126, 0.7152, 0.0722));   // 残差亮度（纯灰阶，不加颜色）
@@ -3263,26 +3322,27 @@ void ResidCS(uint3 id : SV_DispatchThreadID)
     // 直出模式：把运行时给的原样当作画面（配合 debug_view 看残差热图）
     if (gBypass > 0.5) { gDst[id.xy] = float4(gRes.SampleLevel(gSmp, uv, 0).rgb, 1.0); return; }
 
-    // 输出平滑：残差在 1080p 上做 9 抽头
-    float2 texel = float2(1.0/1920.0, 1.0/1080.0) * gSmooth;
+    // 输出平滑：残差在网络输入尺寸上做 9 抽头
+    uint nw, nh; gFed.GetDimensions(nw, nh);
+    float2 texel = float2(1.0 / float(nw), 1.0 / float(nh)) * gSmooth;
     float3 e;
     if (gUseGpuRes > 0.5) {
         // S5-5：答案与输入都在 GPU 上，直接相减（本地 buffer 载荷从 0 开始）
         // 手工双线性：buffer 不能过滤采样，用 4 邻域插值，消除亚像素移动时的纹素跳变
-        float2 fc = uv * float2(1920.0, 1080.0) - 0.5;
+        float2 fc = uv * float2(nw, nh) - 0.5;
         float2 fl = floor(fc);
         int2 i0 = int2(fl);
         float2 wt = fc - fl;
-        int2 c0 = clamp(i0,          int2(0, 0),       int2(1918, 1078));
-        int2 c11 = clamp(i0 + int2(1, 1), int2(1, 1),  int2(1919, 1079));
+        int2 c0 = clamp(i0,          int2(0, 0),       int2((int)nw - 2, (int)nh - 2));
+        int2 c11 = clamp(i0 + int2(1, 1), int2(1, 1),  int2((int)nw - 1, (int)nh - 1));
         int2 c10 = int2(c11.x, c0.y);
         int2 c01 = int2(c0.x, c11.y);
         float w00 = (1.0 - wt.x) * (1.0 - wt.y);
         float w10 = wt.x * (1.0 - wt.y);
         float w01 = (1.0 - wt.x) * wt.y;
         float w11 = wt.x * wt.y;
-        float4 a = gAns[c0.y*1920 + c0.x] * w00 + gAns[c0.y*1920 + c11.x] * w10
-                 + gAns[c11.y*1920 + c0.x] * w01 + gAns[c11.y*1920 + c11.x] * w11;
+        float4 a = gAns[c0.y * nw + c0.x] * w00 + gAns[c0.y * nw + c11.x] * w10
+                 + gAns[c11.y * nw + c0.x] * w01 + gAns[c11.y * nw + c11.x] * w11;
         float4 f = gFed.Load(int3(c0, 0))  * w00 + gFed.Load(int3(c10, 0)) * w10
                  + gFed.Load(int3(c01, 0)) * w01 + gFed.Load(int3(c11, 0)) * w11;
         e = (a.rgb - f.rgb);
@@ -4251,7 +4311,7 @@ void main(uint3 id : SV_DispatchThreadID)
     // ★ 与 A 侧 DownCS 对齐：2×2 区域平均（源比目标大约 1.16 倍，单点采样会混叠）
     //   原来是单点双线性，导致 B 喂给网络的小图和 A 不是同一张 →
     //   同一场景 A 的 |答案−喂入| ≈7~9、B 只有 2~6（差 3~4 倍）
-    float2 t = float2(0.25 / 1920.0, 0.25 / 1080.0) * 1.16;
+    float2 t = float2(0.25 / float(w), 0.25 / float(h)) * 1.16;
     float4 c  = gS.SampleLevel(gM, uv + float2(-t.x, -t.y), 0);
     c += gS.SampleLevel(gM, uv + float2( t.x, -t.y), 0);
     c += gS.SampleLevel(gM, uv + float2(-t.x,  t.y), 0);
@@ -4448,7 +4508,8 @@ void main(uint3 id : SV_DispatchThreadID)
     //   全额叠上去会让整帧变亮变暗 → 表现为全图亮暗闪。
     //   做法：8 个方向 + 自己共 9 点，在大半径 gLowR 上估均值（很便宜）。
     if (gLowCut > 0.5) {
-        float2 tx = float2(1.0 / 1920.0, 1.0 / 1080.0) * gLowR;
+        uint nw, nh; gFed.GetDimensions(nw, nh);
+        float2 tx = float2(1.0 / float(nw), 1.0 / float(nh)) * gLowR;
         float3 se = e;
         [unroll] for (int kk = 0; kk < 8; ++kk) {
             float ang = (float)kk * 0.7853982;
@@ -6092,6 +6153,7 @@ static bool BuildResources(ID3D12Device* dev, ID3D12Resource* color,
                            ID3D12Resource* mv, ID3D12Resource* dep, ID3D12Resource* outp) {
     // 2026-11-14 c4outp3：堆重建时清零 UAV 就绪标志，强制重新写描述符
     for (int i = 0; i < 3; ++i) g_outp8Ready[i] = false;
+    g_mvPackReady = false;
     
     D3D12_RESOURCE_DESC cd = color->GetDesc();
     D3D12_RESOURCE_DESC od = outp->GetDesc();
@@ -7959,8 +8021,8 @@ static bool A2InitDirect() {
         if (A2In::S(p.gate.load()) != A2In::Free) continue;
         if (p.bufA && p.bufW && p.mirror && p.marker && p.prodA && p.prodW) { ++readySlots; continue; }
         newlyCreated[i] = true;
-        if (!MakeXBuf(2 * A2In::kPlane, "A2 direct pair", p.heapA, p.bufA, p.heapW, p.bufW) ||
-            !F9Id::Buffer(gNative.Get(), A2In::kPlane + sizeof(F9Id::Stamp), false, p.mirror) ||
+        if (!MakeXBuf(2 * A2In::Plane(), "A2 direct pair", p.heapA, p.bufA, p.heapW, p.bufW) ||
+            !F9Id::Buffer(gNative.Get(), A2In::Plane() + sizeof(F9Id::Stamp), false, p.mirror) ||
             !F9Id::Buffer(gNative.Get(), sizeof(F9Id::Stamp), true, p.marker)) { rollback(); return false; }
         auto hr = gNative->CreateFence(0, D3D12_FENCE_FLAG_SHARED | D3D12_FENCE_FLAG_SHARED_CROSS_ADAPTER,
                                        IID_PPV_ARGS(&p.prodA));
@@ -7984,7 +8046,7 @@ static void XAdapterInit() {
     const bool sameCard = (la.HighPart == lb.HighPart && la.LowPart == lb.LowPart);
     Log("R2: 游戏设备 LUID=%08X:%08X | worker LUID=%08X:%08X | 同卡=%d",
         (unsigned)la.HighPart, (unsigned)la.LowPart, (unsigned)lb.HighPart, (unsigned)lb.LowPart, (int)sameCard);
-    const UINT64 PAY = 1920ull * 1080ull * 4ull;
+    const UINT64 PAY = AnsBytes();
     const bool a2Req = g_backendNgx && !sameCard && !g_cpuIn;
     A2In::requested.store(a2Req);
     // Avoid keeping unused legacy 16 MiB input/MV buffers when A2 direct path is requested.
@@ -7996,12 +8058,15 @@ static void XAdapterInit() {
         else
             Log("!! NGX: MV cross-card channel failed -> MV not fed");
     }
-    HRESULT h1 = g_dev->CreateFence(0, D3D12_FENCE_FLAG_SHARED, IID_PPV_ARGS(g_xFence.GetAddressOf()));
-    HRESULT h2 = E_FAIL, h3 = E_FAIL;
-    if (SUCCEEDED(h1)) {
-        HANDLE sh = nullptr;
-        h2 = g_dev->CreateSharedHandle(g_xFence.Get(), nullptr, GENERIC_ALL, nullptr, &sh);
-        if (SUCCEEDED(h2)) { h3 = g_worker.dev->OpenSharedHandle(sh, IID_PPV_ARGS(g_xFenceW.GetAddressOf())); CloseHandle(sh); }
+    if (!g_xFence) {
+        HRESULT h1 = g_dev->CreateFence(0, D3D12_FENCE_FLAG_SHARED, IID_PPV_ARGS(g_xFence.GetAddressOf()));
+        HRESULT h2 = E_FAIL, h3 = E_FAIL;
+        if (SUCCEEDED(h1)) {
+            HANDLE sh = nullptr;
+            h2 = g_dev->CreateSharedHandle(g_xFence.Get(), nullptr, GENERIC_ALL, nullptr, &sh);
+            if (SUCCEEDED(h2)) { h3 = g_worker.dev->OpenSharedHandle(sh, IID_PPV_ARGS(g_xFenceW.GetAddressOf())); CloseHandle(sh); }
+        }
+        Log("R2: shared fence create=0x%08X export=0x%08X open=0x%08X", (unsigned)h1, (unsigned)h2, (unsigned)h3);
     }
     g_xOk = a && b;
     if (a2Req) {
@@ -8019,7 +8084,7 @@ static void XAdapterInit() {
             Log("A2-INPUT-DIRECT: deferred while B-form active (on-demand allocation)");
         }
     }
-    Log("R2 结果: buffer=%d 共享fence 建=0x%08X 导出=0x%08X worker打开=0x%08X", (int)g_xOk, (unsigned)h1, (unsigned)h2, (unsigned)h3);
+    Log("R2 结果: buffer=%d net=%ux%u", (int)g_xOk, kNetW, kNetH);
     // S5-4：本地中转 buffer（普通 buffer 才能建 SRV）
     if (g_xOk && g_heap) {
         D3D12_HEAP_PROPERTIES lh{};
@@ -8027,9 +8092,10 @@ static void XAdapterInit() {
         lh.CreationNodeMask = 1; lh.VisibleNodeMask = 1;
         D3D12_RESOURCE_DESC ld{};
         ld.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-        ld.Width = ANS_BYTES; ld.Height = 1; ld.DepthOrArraySize = 1; ld.MipLevels = 1;
+        ld.Width = AnsBytes(); ld.Height = 1; ld.DepthOrArraySize = 1; ld.MipLevels = 1;
         ld.Format = DXGI_FORMAT_UNKNOWN; ld.SampleDesc.Count = 1;
         ld.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        g_ansLocal.Reset();
         HRESULT hl = g_dev->CreateCommittedResource(&lh, D3D12_HEAP_FLAG_NONE, &ld,
                         D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(g_ansLocal.GetAddressOf()));
         if (SUCCEEDED(hl)) {
@@ -8038,13 +8104,13 @@ static void XAdapterInit() {
             sd.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
             sd.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
             sd.Buffer.FirstElement = 0;
-            sd.Buffer.NumElements = (UINT)(ANS_BYTES / 4);
+            sd.Buffer.NumElements = (UINT)(AnsBytes() / 4);
             sd.Buffer.StructureByteStride = 0;
             sd.Buffer.Flags = D3D12_BUFFER_SRV_FLAG_NONE;
             D3D12_CPU_DESCRIPTOR_HANDLE dh = g_heap->GetCPUDescriptorHandleForHeapStart();
             dh.ptr += (SIZE_T)kSrvAns * g_inc;
             g_dev->CreateShaderResourceView(g_ansLocal.Get(), &sd, dh);
-            Log("S5-4: 本地中转 buffer %llu 字节 + SRV（槽 %d）已建", (unsigned long long)ANS_BYTES, (int)kSrvAns);
+            Log("S5-4: 本地中转 buffer %llu 字节 + SRV（槽 %d）已建", (unsigned long long)AnsBytes(), (int)kSrvAns);
         } else {
             Log("S5-4: 本地 buffer 建失败 0x%08X", (unsigned)hl);
         }
@@ -8058,6 +8124,7 @@ static void XAdapterInit() {
         ud.Width = XHDR; ud.Height = 1; ud.DepthOrArraySize = 1; ud.MipLevels = 1;
         ud.Format = DXGI_FORMAT_UNKNOWN; ud.SampleDesc.Count = 1;
         ud.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        g_xHdrUp.Reset();
         if (SUCCEEDED(g_dev->CreateCommittedResource(&uh, D3D12_HEAP_FLAG_NONE, &ud,
                 D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(g_xHdrUp.GetAddressOf())))) {
             void* pm = nullptr;
@@ -8065,9 +8132,9 @@ static void XAdapterInit() {
             if (SUCCEEDED(g_xHdrUp->Map(0, &zr, &pm)) && pm) {
                 struct XH { unsigned int magic, ver, w, h, fmt, pitch, frame, pad; };
                 XH* hh = (XH*)pm;
-                hh->magic = 0x31524E58u; hh->ver = 1; hh->w = 1920; hh->h = 1080;
-                hh->fmt = 28; hh->pitch = 1920 * 4; hh->frame = 0; hh->pad = 0;
-                Log("R3: 头部已写 magic=XNR1 1920x1080 pitch=7680 头部=%d B", (int)XHDR);
+                hh->magic = 0x31524E58u; hh->ver = 1; hh->w = kNetW; hh->h = kNetH;
+                hh->fmt = 28; hh->pitch = kNetW * 4; hh->frame = 0; hh->pad = 0;
+                Log("R3: 头部已写 magic=XNR1 %ux%u pitch=%u 头部=%d B", kNetW, kNetH, kNetW * 4, (int)XHDR);
             }
         }
     }
@@ -8081,7 +8148,7 @@ static bool ShareInit() {
         hp.CreationNodeMask = 1; hp.VisibleNodeMask = 1;
         D3D12_RESOURCE_DESC td{};
         td.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
-        td.Width = 1920; td.Height = 1080; td.DepthOrArraySize = 1; td.MipLevels = 1;
+        td.Width = kNetW; td.Height = kNetH; td.DepthOrArraySize = 1; td.MipLevels = 1;
         td.Format = DXGI_FORMAT_R8G8B8A8_UNORM; td.SampleDesc.Count = 1;
         td.Flags = D3D12_RESOURCE_FLAG_NONE;
         HRESULT h = g_dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_SHARED, &td,
@@ -8268,6 +8335,71 @@ extern "C" __declspec(dllexport) void AmdNrBbSlotFree(unsigned frameTag) {
 // ★ 适配层唯一接缝：真派发（XeSS 构建 = g_xessTab[30]；FFX/FSR 构建由适配层注入 ffxDispatch）
 extern "C" void* g_realDispatchFn = nullptr;
 #include "a3_render.h"
+
+static bool RebuildNetResolution(UINT wantW, UINT wantH, ID3D12Resource* color,
+                                 ID3D12Resource* mvRes, ID3D12Resource* depRes, ID3D12Resource* outp) {
+    Log("★ NR Scale 变化: %ux%u → %ux%u (mode=%d)，暂停 worker 并安全重建跨卡与 0.0.9 资源",
+        kNetW, kNetH, wantW, wantH, (int)g_nrScaleMode);
+    g_netRebuilding.store(true, std::memory_order_release);
+    {
+        std::unique_lock<std::mutex> lk(g_worker.m);
+        g_worker.pauseReq = true;
+        if (g_worker.a3WakeEvent) SetEvent(g_worker.a3WakeEvent);
+        g_worker.cv.notify_all();
+        g_worker.pausedCv.wait_for(lk, std::chrono::milliseconds(2000),
+                                   [&] { return g_worker.pausedAck || g_worker.quit; });
+    }
+    if (g_bpReady && g_bpFe && g_bpAlFv[0] > 0 && g_bpFe->GetCompletedValue() < g_bpAlFv[0]) {
+        HANDLE ev = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        if (ev) {
+            if (SUCCEEDED(g_bpFe->SetEventOnCompletion(g_bpAlFv[0], ev))) WaitForSingleObject(ev, 1000);
+            CloseHandle(ev);
+        }
+    }
+    Sleep(80);
+    if (g_bbFe) {
+        UINT64 maxUsed = 0;
+        for (int i = 0; i < 3; ++i) if (g_bbFvUsed[i] > maxUsed) maxUsed = g_bbFvUsed[i];
+        if (maxUsed > 0 && g_bbFe->GetCompletedValue() < maxUsed) {
+            g_bbFe->SetEventOnCompletion(maxUsed, nullptr);
+            Sleep(16);
+        }
+    }
+    A3::ResetForScale();
+    A2In::ResetAll();
+    A2EnsureMvScratch(true);
+    g_xBufIn.Reset(); g_xBufInW.Reset(); g_xHeapIn.Reset(); g_xHeapInW.Reset();
+    g_xBufOut.Reset(); g_xBufOutW.Reset(); g_xHeapOut.Reset(); g_xHeapOutW.Reset();
+    g_xBufVel.Reset(); g_xBufVelW.Reset(); g_xHeapVel.Reset(); g_xHeapVelW.Reset();
+    g_ansLocal.Reset(); g_xHdrUp.Reset(); g_xOk = false;
+    for (auto& mh : g_mvHist) mh.Reset();
+    g_bformReady = false; g_bTexReady = false;
+    g_bTexC.Reset(); g_bTexM.Reset(); g_bTexD.Reset();
+    g_upBuf.Reset(); g_upBufW.Reset(); g_upHeap.Reset(); g_upHeapW.Reset();
+    g_bDsReady = false; g_bDs1080.Reset();
+    g_bCompReady = false; g_bState.Reset(); g_bStateCleared = false;
+    g_worker.color.Reset(); g_worker.vel.Reset();
+    g_worker.up.Reset(); g_worker.upPtr = nullptr;
+    g_worker.bMvZeroUp.Reset(); g_worker.rbPriv.Reset(); g_worker.bytesPriv = 0;
+
+    kNetW = wantW; kNetH = wantH;
+    ++g_buildGen;
+    bool ok = WorkerAllocNetResources() && BuildResources(g_dev.Get(), color, mvRes, depRes, outp);
+    if (ok) XAdapterInit();
+    for (int i = 0; i < K; ++i) {
+        g_slots[i].hasAnswer = false; g_slots[i].answerFrame = -1; g_slots[i].frame = -1; g_slots[i].captured = false;
+    }
+    g_dumpPhase = 0;
+    {
+        std::lock_guard<std::mutex> lk(g_worker.m);
+        g_worker.aReset.Raise(A1Rebuild, g_frame);
+        g_worker.pauseReq = false;
+        g_worker.cv.notify_all();
+    }
+    g_netRebuilding.store(false, std::memory_order_release);
+    Log("★ NR Scale 重建%s：%ux%u", ok ? "完成" : "失败", kNetW, kNetH);
+    return ok;
+}
 
 extern "C" int ProxyExecute(void* ctx, void* cmdList, const void* params, float adapterMvScale,
                             const AdapterFrameDesc* adapterDesc) {
@@ -8467,6 +8599,11 @@ extern "C" int ProxyExecute(void* ctx, void* cmdList, const void* params, float 
         if (FAILED(color->GetDevice(__uuidof(ID3D12Device), (void**)g_dev.GetAddressOf())) || !g_dev) {
             gaveUp = true; return real ? real(ctx, cmdList, params) : errRc;
         }
+        {
+            D3D12_RESOURCE_DESC cdInit = color->GetDesc();
+            ComputeNetDims((int)g_nrScaleMode, (UINT)cdInit.Width, cdInit.Height, kNetW, kNetH);
+            Log("启动 NR 推理尺寸: %ux%u (nr_scale_mode=%d)", kNetW, kNetH, (int)g_nrScaleMode);
+        }
         if (!BuildResources(g_dev.Get(), color, mvRes, depRes, outp) || !WorkerInit()) {
             gaveUp = true; Log("!! 初始化失败，永久放弃"); return real ? real(ctx, cmdList, params) : errRc;
         }
@@ -8543,7 +8680,19 @@ extern "C" int ProxyExecute(void* ctx, void* cmdList, const void* params, float 
             }
             rebuiltAResources = true;
             lw = g_cw; lh = g_ch; lf = g_cfmt; low = g_outW; loh = g_outH;
-            Log("重建完成：%ux%u fmt=%d（网络输入仍为 %ux%u）", g_cw, g_ch, (int)g_cfmt, kNetW, kNetH);
+            Log("重建完成：%ux%u fmt=%d（网络输入为 %ux%u）", g_cw, g_ch, (int)g_cfmt, kNetW, kNetH);
+        }
+    }
+    // ★ Stage 3 NR Scale：菜单切换倍率或相对倍率下主渲染尺寸变动 → 暂停 worker 后安全重建
+    if (inited && color && outp) {
+        UINT wantW = 1920, wantH = 1080;
+        ComputeNetDims((int)g_nrScaleMode, g_cw, g_ch, wantW, wantH);
+        if (wantW != kNetW || wantH != kNetH) {
+            if (!RebuildNetResolution(wantW, wantH, color, mvRes, depRes, outp)) {
+                Log("!! NR Scale 重建失败 → 永久放弃 NR");
+                gaveUp = true; return real ? real(ctx, cmdList, params) : errRc;
+            }
+            rebuiltAResources = true;
         }
     }
 
@@ -9126,15 +9275,9 @@ extern "C" int ProxyExecute(void* ctx, void* cmdList, const void* params, float 
         }
     }
 
-    // ★ 跑马灯：本设置同样供 B 侧读取，不依赖 A 侧 DownCS 是否工作。
+    // F7 跑马灯诊断已关闭（A/B 双形态一致保持纯净画面）
     static int& mqOn = *(int*)&g_marqueeOn;
-    if (mqOn < 0) {
-        std::string mp = ModuleDir() + "xess_proxy.marquee.txt";
-        FILE* mf = nullptr; char b0[8] = { 0 };
-        mqOn = 0;
-        if (fopen_s(&mf, mp.c_str(), "r") == 0 && mf) { if (fgets(b0, sizeof(b0), mf) && b0[0] == '1') mqOn = 1; fclose(mf); }
-        Log("跑马灯(底图): %s", mqOn ? "开启（喂入前把槽位底图涂成相位黑条，相位=帧号%4）" : "关闭");
-    }
+    if (mqOn < 0) mqOn = 0;
 
     // A2 records both planes on the same list that actually captured slot[N]. The
     // worker still requests N at dispatch N+2; no changes to presentation or feed lag.
@@ -9228,7 +9371,7 @@ extern "C" int ProxyExecute(void* ctx, void* cmdList, const void* params, float 
             xd.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
             {   // ★按槽号写：与 inIndex 同一个槽，worker 按 idx 读才配对
                 const int wi = 0;   // RE2 原样：单段
-                xd.PlacedFootprint.Offset = XHDR + (UINT64)wi * ANS_BYTES;   // 每槽字节
+                xd.PlacedFootprint.Offset = XHDR + (UINT64)wi * AnsBytes();   // 每槽字节
             }
             xd.PlacedFootprint.Footprint.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
             xd.PlacedFootprint.Footprint.Width = kNetW;
@@ -9312,7 +9455,7 @@ extern "C" int ProxyExecute(void* ctx, void* cmdList, const void* params, float 
             if (g_ansLocal && g_xBufOut) {   // S5-4：答案从共享 buffer 拷到本地（供 SRV 读）
                 Barrier(cl, g_xBufOut.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE);
                 Barrier(cl, g_ansLocal.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST);
-                cl->CopyBufferRegion(g_ansLocal.Get(), 0, g_xBufOut.Get(), XHDR + (UINT64)(presentFrame % K) * ANS_BYTES, ANS_BYTES);
+                cl->CopyBufferRegion(g_ansLocal.Get(), 0, g_xBufOut.Get(), XHDR + (UINT64)(presentFrame % K) * AnsBytes(), AnsBytes());
                 Barrier(cl, g_ansLocal.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
                 f9A.Tap(F9Id::AAnswer, g_ansLocal.Get(), presentFrame, presentFrame, F9Id::CopyOnly);
                 Barrier(cl, g_xBufOut.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON);
@@ -9600,18 +9743,11 @@ extern "C" int ProxyExecute(void* ctx, void* cmdList, const void* params, float 
             { std::lock_guard<std::mutex> lk(g_worker.m); dumpOne("ans", g_worker.ansBuf[sl2]); }
         }
     }
-    // ★ 三横带对照视图（诊断）：开关文件 xess_proxy.triband.txt = 1
-    //   覆写 g_pre 为【上=答案 / 中=残差 / 下=我们涂的底图+残差】，底图不保留游戏原图
+    // F8 三横带诊断视图已关闭（与 A 形态 A3 一致）
     {
-        static int& tbOn = *(int*)&g_triOn;   // 提升到文件作用域，供 F8 热键切换
-        if (tbOn < 0) {
-            std::string tp = ModuleDir() + "xess_proxy.triband.txt";
-            FILE* tf = nullptr; char b0[8] = { 0 };
-            tbOn = 0;
-            if (fopen_s(&tf, tp.c_str(), "r") == 0 && tf) { if (fgets(b0, sizeof(b0), tf) && b0[0] == '1') tbOn = 1; fclose(tf); }
-            Log("三横带视图: %s", tbOn ? "开启（上=答案 中=残差 下=底图(我们的图案)+残差）" : "关闭");
-        }
-        if (tbOn) {
+        static int& tbOn = *(int*)&g_triOn;
+        if (tbOn < 0) tbOn = 0;
+        if (false && tbOn) {
             TriPass(cl, (int)(presentFrame % 4), g_cw, g_ch, srvFedPair, (UINT)kSrvAns, slotBase);
             if (g_psoTri && g_pre) f9A.AnswerPath(F9Id::TriBands);
         }
@@ -10265,6 +10401,24 @@ static void MenuSectionNrControls() {
     ImGui::TextDisabled("%s | %s（点下方“保存设置”可持久化到 xess_proxy.saved.ini）",
                         g_backendNgx ? "后端=NGX (dlssnr_core)" : "后端=mochizuki",
                         g_ctrlDirty ? "等待 worker 下发" : "已下发");
+    ImGui::Separator();
+    ImGui::TextDisabled("════ NR 推理分辨率倍率 (NR Scale · 移植自 mochizuki) ════");
+    int sm = (int)g_nrScaleMode;
+    if (sm < 0 || sm > 7) sm = 0;
+    if (ImGui::Combo("推理尺寸档位 (NR Scale)", &sm,
+                     "0 固定 1080p (1920x1080 · 默认经典)\0"
+                     "1 50% 渲染分辨率\0"
+                     "2 67% 渲染分辨率\0"
+                     "3 75% 渲染分辨率\0"
+                     "4 100% 渲染分辨率 (原生 1:1)\0"
+                     "5 固定 720p (1280x720 · 高帧率)\0"
+                     "6 固定 900p (1600x900 · 均衡)\0"
+                     "7 固定 1440p (2560x1440 · 高精细)\0")) {
+        g_nrScaleMode = sm;
+        Log("菜单(NR Scale): 请求切换档位 %d", sm);
+    }
+    ImGui::SetItemTooltip("调节副卡 NR 网络推理分辨率（低于原图=提帧减带宽；等于渲染=原生 1:1 精细）；切换时安全重建跨卡与 0.0.9 会话");
+    ImGui::TextDisabled("当前 NR 网络尺寸: %u x %u（相对基准 %u x %u · 随保存设置联动）", kNetW, kNetH, g_cw, g_ch);
     ImGui::Separator();
 }
 
@@ -11196,18 +11350,17 @@ static DWORD WINAPI HotkeyThread(LPVOID) {
         // ★ v4 P23：F10 走模式矩阵（特性未启用时内部退回旧行为：只切 g_nrOn，日志口径不变）
         if (d10 && !p10) { UiGateHotkeyToggle(); }
         p10 = d10;
-        // ★ F8：三横带诊断视图 ⇄ 正常 NR 画面
+        // F7/F8 诊断热键已停用（B 形态不再保留跑马灯/三横带功能，与 A 形态一致）
         static bool pF8 = false;
-        bool dF8 = (GetAsyncKeyState(VK_F8) & 0x8000) != 0;
+        bool dF8 = false;
         if (dF8 && !pF8) {
             if (g_triOn < 0) g_triOn = 1;
             g_triOn = g_triOn ? 0 : 1;
             Log("*** F8: 视图切换 → %s ***", g_triOn ? "三横带诊断（上答案/中残差/下底图）" : "正常 NR 画面");
         }
         pF8 = dF8;
-        // ★ F7：黑条标记开/关（关掉后看到的就是纯净的 NR 结果）
         static bool pF7 = false;
-        bool dF7 = (GetAsyncKeyState(VK_F7) & 0x8000) != 0;
+        bool dF7 = false;
         if (dF7 && !pF7) {
             if (g_marqueeOn < 0) g_marqueeOn = 0;
             g_marqueeOn = g_marqueeOn ? 0 : 1;

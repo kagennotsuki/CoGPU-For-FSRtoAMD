@@ -25,10 +25,12 @@
 - **A / B 双运行形态实时热切换（快捷键 `F3`）**：
   - **A 形态（A3 12 槽同帧合成 + 超分）**：主卡采集 Color / MV / Depth 传给副卡推理，`1080p` 答案回传后在同帧资源与真实超分器内合成输出（副卡来不及出新帧时在缓存窗内平滑复用最近完成帧）。
   - **B 形态（4K 后置 DComp 覆盖 + 直连抓帧）**：主 SwapChain 提交前直连抓取 `PRESENT` 后缓冲送副卡完成 `1080p NR -> 4K` 合成，经独立 DComp 透明窗口叠加出画。
+- **可热切换 NR 推理分辨率倍率（NR Scale · 移植自 mochizuki）**：
+  - 支持在 `Del` 菜单内直接切换 `固定 1080p`、`50% / 67% / 75% / 100% 渲染分辨率`、`固定 720p / 900p / 1440p` 共 8 档（默认保持经典 `1080p`），自动安全排空双卡队列并重建跨卡共享资源与 0.0.9 会话（`F7 / F8` 跑马灯与三横带诊断已在 A/B 双形态统一关闭）。
 - **GPU 预处理实装（`[Preprocess]`）**：
   - 在 `DownCS` / `kBformDS` 计算着色器内直接支持预处理总开关、曝光增益（EV Bias）、色调曲线（`none / neutral / reinhard / filmic / gt / aces / agx`）、中灰对比度与饱和度调节，并同步 `dlssnr-amd.ini` 与 `xess_proxy.saved.ini`。
 - **完整菜单控制与配置持久化（快捷键 `Del`）**：
-  - 0.0.9 网络模型热切换（`CC_SMALL_FP8_EXPERIMENTAL` / `CC_SMALL_FP8` / `CC_SILVER_AARDWOLD_OPTIMIZED` / `CC_SILVER_AARDWOLD`）、优化档位、16/32-bit 历史精度、Style Grade、Intensity/Style/LocalTone/LocalStruct/SkinStruct 控制与保存/撤销/恢复默认按钮。
+  - 0.0.9 网络模型热切换（`CC_SMALL_FP8_EXPERIMENTAL` / `CC_SMALL_FP8` / `CC_SILVER_AARDWOLD_OPTIMIZED` / `CC_SILVER_AARDWOLD`）、优化档位、16/32-bit 历史精度、Style Grade、NR Scale、Intensity/Style/LocalTone/LocalStruct/SkinStruct 控制与保存/撤销/恢复默认按钮。
 
 ---
 
@@ -111,9 +113,9 @@ powershell -ExecutionPolicy Bypass -File .\scripts\build_ffx_proxy.ps1
 
 | 文件 | 大小 (Bytes) | SHA256 |
 |---|---:|---|
-| `prebuilt/OptiScaler/plugins/cogpu_nr.asi` | `1,100,288` | `3D6D738D480F0615E9DCEC8AF520027AA2106D69F6038D78F42B26CCE0BAA528` |
+| `prebuilt/OptiScaler/plugins/cogpu_nr.asi` | `1,103,872` | `0753EC1E7A31847F252316D84C7767CE4E1F09346AF202644B2BCB26146AE2A9` |
 | `prebuilt/dlssnr_core.dll` | `6,035,547` | `89CBA727B4440EA99F74354DB866285C3498044DFB43EF8E905EF4ECAF617642` |
-| `prebuilt/standalone_ffx_proxy/amd_fidelityfx_upscaler_dx12.dll` | `1,069,568` | `843B9865D9FB17EB11D31A9A1F7070D1B9307FF628741D3803DC8234C180D44F` |
+| `prebuilt/standalone_ffx_proxy/amd_fidelityfx_upscaler_dx12.dll` | `1,072,640` | `12AC462372575BDB3D780D776E9C9C05943EEE0A4DC38BAA95AF2CF483E40592` |
 
 ---
 

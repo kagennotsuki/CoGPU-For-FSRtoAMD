@@ -225,6 +225,7 @@ extern "C" bool NgxBackendEnsure(ID3D12GraphicsCommandList* cl, unsigned w, unsi
     if (g_nb.handle && (g_nb.w != w || g_nb.h != h)) {
         if (g_nb.Release) g_nb.Release(g_nb.handle);
         g_nb.handle = nullptr;
+        if (g_nb.out) { g_nb.out->Release(); g_nb.out = nullptr; }
         NgxLog("size changed -> rebuild feature (%ux%u)", w, h);
     }
     if (!g_nb.out) {

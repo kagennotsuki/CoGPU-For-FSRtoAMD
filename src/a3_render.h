@@ -4,7 +4,7 @@
 namespace A3 {
 enum View : UINT { Base, Mv, Fed, LocalAnswer, ComposeSrc, OutSrc, AnswerImage,
                    FedUav, MvUav, ComposeUav, Add4kUav, ViewCount };
-static constexpr UINT64 Bytes = A2In::kPlane;
+static inline UINT64 Bytes() { return A2In::Plane(); }
 static void* lastContext = nullptr;
 static bool everActive = false;
 static Key cacheKey;
@@ -53,10 +53,27 @@ static void Uav(const Input& p, UINT slot, ID3D12Resource* r) {
     g_dev->CreateUnorderedAccessView(r, nullptr, &d, Handle(p, slot));
 }
 static bool InitAnswerResources() { // main, only while the ring lock is held
-    for (auto& a : answers) if (!a.bufA || !a.bufW) {
-        if (!MakeXBuf(Bytes, "A3 independent answer", a.heapA, a.bufA, a.heapW, a.bufW)) return false;
+    const UINT64 sz = Bytes();
+    for (auto& a : answers) if (!a.bufA || !a.bufW || a.bytes != sz) {
+        a.heapA.Reset(); a.bufA.Reset(); a.heapW.Reset(); a.bufW.Reset(); a.bytes = 0;
+        if (!MakeXBuf(sz, "A3 independent answer", a.heapA, a.bufA, a.heapW, a.bufW)) return false;
+        a.bytes = sz;
     }
     return true;
+}
+static void ResetForScale() {
+    std::lock_guard lk(m);
+    for (auto& a : answers) {
+        a.Clear();
+        a.heapA.Reset(); a.bufA.Reset(); a.heapW.Reset(); a.bufW.Reset(); a.bytes = 0;
+    }
+    for (auto& p : inputs) {
+        p.netW = p.netH = 0;
+        p.fed.Reset(); p.packed.Reset(); p.localAnswer.Reset(); p.answerImage.Reset();
+    }
+    cache.Reset(); cacheAge.Clear(); cacheKey = {};
+    candidates.clear();
+    lastOffered = lastRecorded = lastNativeDispatch = -1;
 }
 static bool Prepare(Input& p, const AdapterFrameDesc& live) {
     auto d = live;
@@ -80,10 +97,14 @@ static bool Prepare(Input& p, const AdapterFrameDesc& live) {
     if (!p.composed || !SameShape(p.composed->GetDesc(), color)) {
         p.composed = MakeTex(g_dev.Get(), UINT(color.Width), color.Height, color.Format, D3D12_RESOURCE_STATE_COMMON, true);
     }
+    if (p.netW != kNetW || p.netH != kNetH) {
+        p.fed.Reset(); p.packed.Reset(); p.localAnswer.Reset(); p.answerImage.Reset();
+        p.netW = kNetW; p.netH = kNetH;
+    }
     if (!p.fed) p.fed = MakeTex(g_dev.Get(), kNetW, kNetH, DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_STATE_COMMON, true);
     if (!p.packed) p.packed = MakeTex(g_dev.Get(), kNetW, kNetH, DXGI_FORMAT_R16G16_FLOAT, D3D12_RESOURCE_STATE_COMMON, true);
     if (!p.localAnswer) {
-        D3D12_RESOURCE_DESC b{}; b.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER; b.Width = Bytes;
+        D3D12_RESOURCE_DESC b{}; b.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER; b.Width = Bytes();
         b.Height = b.DepthOrArraySize = b.MipLevels = b.SampleDesc.Count = 1; b.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
         p.localAnswer = FromDesc(b);
     }
@@ -210,7 +231,7 @@ static void Compose(ID3D12GraphicsCommandList* cl, Input& p, Answer& a, F9Id::AR
     auto* ans = p.localAnswer.Get(); auto* color = p.captured[0].Get();
     Barrier(cl, a.bufA.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE);
     Barrier(cl, ans, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST);
-    cl->CopyBufferRegion(ans, 0, a.bufA.Get(), 0, Bytes);
+    cl->CopyBufferRegion(ans, 0, a.bufA.Get(), 0, Bytes());
     if (bypass) {
         auto* img = p.answerImage.Get();
         Barrier(cl, img, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST);
@@ -284,6 +305,10 @@ static int Render(void* ctx, ID3D12GraphicsCommandList* cl, const AdapterFrameDe
                   int(*real)(void*, void*, const void*), const void* params, Key key,
                   A2In::Producer& producer, F9Id::ARecord& f9) {
     auto* out = static_cast<ID3D12Resource*>(d.output.resource);
+    if (g_netRebuilding.load(std::memory_order_acquire)) {
+        StopDisplay(key.frame);
+        return real ? real(ctx, cl, params) : d.errCode;
+    }
     if (d.hasUnsupportedExt || !d.output.valid || !out || !Surface(out->GetDesc())) {
         // Unknown extension pointers can carry frame-local payloads. Never splice
         // them onto an older frame; native forwards the entire original chain.

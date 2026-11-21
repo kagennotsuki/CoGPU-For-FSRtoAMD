@@ -17,6 +17,7 @@ static int PickNewest(const int (&tags)[kSlots], const bool (&valid)[kSlots], in
 }
 struct Input {
     AdapterFrameDesc desc{}; // stored with an empty ext/list/output plus adapter snapshot
+    UINT netW = 0, netH = 0;
     ComPtr<ID3D12Resource> source[6], captured[6]; // color, MV, depth, exposure, reactive, transparency
     ComPtr<ID3D12Resource> fed, packed, composed, localAnswer, answerImage, add4k;
     ComPtr<ID3D12DescriptorHeap> heap;
@@ -27,7 +28,7 @@ static Input inputs[kSlots];
 struct Answer {
     enum State { Free, Writing, Ready, Reading, Quarantined } state = Free;
     A2In::Token input;
-    UINT64 serial = 0, fenceValue = 0;
+    UINT64 serial = 0, fenceValue = 0, bytes = 0;
     ComPtr<ID3D12Fence> fence;
     ComPtr<ID3D12Heap> heapA, heapW;
     ComPtr<ID3D12Resource> bufA, bufW;

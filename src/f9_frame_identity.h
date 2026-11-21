@@ -75,6 +75,14 @@ static bool TextureShape(ID3D12Resource* src, DXGI_FORMAT fmt) {
     return d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D && d.Format == fmt &&
            d.Width == kNetW && d.Height == kNetH && d.SampleDesc.Count == 1;
 }
+static UINT PatchX(UINT i) {
+    UINT x = (kX[i] * kNetW) / 1920u;
+    return (kNetW > kSpan && x + kSpan <= kNetW) ? x : (kNetW > kSpan ? kNetW - kSpan : 0u);
+}
+static UINT PatchY(UINT i) {
+    UINT y = (kY[i] * kNetH) / 1080u;
+    return (kNetH > 0 && y < kNetH) ? y : (kNetH > 0 ? kNetH - 1u : 0u);
+}
 static void CopyTex(ID3D12GraphicsCommandList* cl, ID3D12Resource* dst, UINT64 off,
                     ID3D12Resource* src, DXGI_FORMAT fmt, D3D12_RESOURCE_STATES st) {
     Transition(cl, src, st, D3D12_RESOURCE_STATE_COPY_SOURCE);
@@ -84,7 +92,8 @@ static void CopyTex(ID3D12GraphicsCommandList* cl, ID3D12Resource* dst, UINT64 o
     D3D12_TEXTURE_COPY_LOCATION s{};
     s.pResource = src; s.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
     for (UINT i = 0; i < kN; ++i) {
-        D3D12_BOX box{kX[i], kY[i], 0, kX[i] + kSpan, kY[i] + 1, 1};
+        const UINT px = PatchX(i), py = PatchY(i);
+        D3D12_BOX box{px, py, 0, px + kSpan, py + 1, 1};
         cl->CopyTextureRegion(&d, i * kSpan, 0, 0, &s, &box);
     }
     Transition(cl, src, D3D12_RESOURCE_STATE_COPY_SOURCE, st);
@@ -94,7 +103,7 @@ static void CopyAnswer(ID3D12GraphicsCommandList* cl, ID3D12Resource* dst, UINT6
     Transition(cl, src, st, D3D12_RESOURCE_STATE_COPY_SOURCE);
     for (UINT i = 0; i < kN; ++i)
         cl->CopyBufferRegion(dst, off + i * kSpan * 4, src,
-            (UINT64(kY[i]) * kNetW + kX[i]) * 4, kSpan * 4);
+            (UINT64(PatchY(i)) * kNetW + PatchX(i)) * 4, kSpan * 4);
     Transition(cl, src, D3D12_RESOURCE_STATE_COPY_SOURCE, st);
 }
 
