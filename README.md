@@ -56,9 +56,9 @@ CoGPU-For-FSRtoAMD/
 ## 部署方法 / Installation (Cyberpunk 2077 / DX12 FSR Games)
 
 1. **准备上游组件（放进游戏 `.exe` 所在目录，例如 `Cyberpunk 2077\bin\x64\`）**：
-   - 从 [**OptiScaler 官方发布页**](https://github.com/optiscaler/OptiScaler/releases) 下载 OptiScaler（以 `dxgi.dll` 形式放入游戏目录，并保留其 `OptiScaler\` 子目录及超分后端 DLL）。
-   - 从 [**mochizuki0323 / DLSSNR-AMD v0.0.9 Releases**](https://gitlab.com/mochizuki0323/DLSSNR-AMD/-/releases) 下载官方模型权重与着色器包，将 `dlssnr-amd\` 目录（含 `CC_*.bin`、`aco/`、`shaders/`）放入游戏目录。
-   - 清理旧残留：确认游戏目录内**没有** ReShade `dxgi.dll`、`finalimg.addon64` 或官方单卡 `dlssnr-amd.asi`，且此前替换过游戏自带 `amd_fidelityfx_upscaler_dx12.dll` 的请先还原。
+   - **OptiScaler（必须支持 `v10.0` ASI 插件机制）**：下载并在游戏中部署 [**OptiScaler Nightly (`v10.0.0-pre1` · 实测 `nightly-20261030` / commit `e7e3872d`)**](https://github.com/optiscaler/OptiScaler-nightly/releases/tag/nightly-20261030)（[上游主仓库](https://github.com/optiscaler/OptiScaler)，也已原样内置于 `DLSSNR-AMD v0.0.9` 官方压缩包内的 `optiscaler\release\` 目录），以 `dxgi.dll` 形式放入游戏目录并保留 `OptiScaler\` 子目录及超分后端 DLL。（旧版 `0.7.x` 稳定版菜单样式不同且缺少配套 ASI 宿主支持）。
+   - **模型与着色器包**：从 [**mochizuki0323 / DLSSNR-AMD v0.0.9 Releases**](https://gitlab.com/mochizuki0323/DLSSNR-AMD/-/releases) 获取（或按其说明从 `nvngx_dlssnr.dll` 提取）`dlssnr-amd\` 目录（含 `CC_*.bin`、`aco/`、`shaders/`）放入游戏目录。
+   - **清理旧残留**：确认游戏目录内**没有** ReShade `dxgi.dll`、`finalimg.addon64` 或官方单卡 `dlssnr-amd.asi`，且此前替换过游戏自带 `amd_fidelityfx_upscaler_dx12.dll` 的请先还原。
 2. **放入本仓库配置与二进制**：
    - 将 `prebuilt/dlssnr_core.dll` 复制到游戏 `.exe` 同目录；
    - 将 `prebuilt/OptiScaler/plugins/cogpu_nr.asi` 复制到 `<游戏目录>\OptiScaler\plugins\cogpu_nr.asi`；

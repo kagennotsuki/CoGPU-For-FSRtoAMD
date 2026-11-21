@@ -43,8 +43,8 @@ This repository incorporates or builds upon several open-source components and c
 
 ## 3. External Runtime Host (Not Bundled in Repository)
 
-### OptiScaler
-- **Repository**: <https://github.com/optiscaler/OptiScaler>
+### OptiScaler (`v10.0.0-pre1` / Nightly `20261030`, commit `e7e3872d`)
+- **Repository**: <https://github.com/optiscaler/OptiScaler> (Tested build from <https://github.com/optiscaler/OptiScaler-nightly/releases/tag/nightly-20261030>, also distributed unmodified inside `mochizuki0323/DLSSNR-AMD` v0.0.9)
 - **License**: **GNU General Public License v3.0 (GPL-3.0)**
 - **Integration Boundary**:
   - `CoGPU-For-FSRtoAMD` does **not** include, compile, or statically link OptiScaler GPL-3.0 source code, nor does this repository redistribute OptiScaler binaries (`dxgi.dll`, XeSS/FFX SDK DLLs).
