@@ -23,8 +23,8 @@
   - 通过 **OptiScaler ASI 插件 (`OptiScaler/plugins/cogpu_nr.asi`)** 接管游戏 NGX / FSR3.1+ 输入并挂载 DXGI Factory / SwapChain `Present` / `Present1` 直接抓帧。
   - 同时保留不依赖 OptiScaler 的独立 **`amd_fidelityfx_upscaler_dx12.dll`** FFX 代理构建路径。
 - **A / B 双运行形态实时热切换（快捷键 `F3`）**：
-  - **A 形态（A3 12 槽同帧合成 + 超分）**：主卡采集 Color / MV / Depth 传给副卡推理，`1080p` 答案回传后在同帧资源与真实超分器内合成输出（副卡来不及出新帧时在缓存窗内平滑复用最近完成帧）。
-  - **B 形态（4K 后置 DComp 覆盖 + 直连抓帧）**：主 SwapChain 提交前直连抓取 `PRESENT` 后缓冲送副卡完成 `1080p NR -> 4K` 合成，经独立 DComp 透明窗口叠加出画。
+  - **A 形态（由【游戏卡】负责呈现最终画面 · A3 同帧合成 + 超分）**：主卡采集 Color / MV / Depth 传给副卡推理，答案回传后在同帧资源与真实超分器内合成并由游戏主卡直接呈现（副卡来不及出新帧时在缓存窗内平滑复用最近完成帧）。
+  - **B 形态（由【神经卡】负责呈现最终画面 · 4K 后置 DComp 覆盖 + 直连抓帧）**：主 SwapChain 提交前直连抓取 `PRESENT` 后缓冲送副卡完成合成，最终画面由神经卡经独立 DComp 透明覆盖层呈现（`Del` 菜单顶部实时显示当前运行形态与呈现显卡，支持一键切换）。
 - **可热切换 NR 推理分辨率倍率（NR Scale · 移植自 mochizuki）**：
   - 支持在 `Del` 菜单内直接切换 `固定 1080p`、`50% / 67% / 75% / 100% 渲染分辨率`、`固定 720p / 900p / 1440p` 共 8 档（默认保持经典 `1080p`），自动安全排空双卡队列并重建跨卡共享资源与 0.0.9 会话（`F7 / F8` 跑马灯与三横带诊断已在 A/B 双形态统一关闭）。
 - **GPU 预处理实装（`[Preprocess]`）**：
@@ -113,9 +113,9 @@ powershell -ExecutionPolicy Bypass -File .\scripts\build_ffx_proxy.ps1
 
 | 文件 | 大小 (Bytes) | SHA256 |
 |---|---:|---|
-| `prebuilt/OptiScaler/plugins/cogpu_nr.asi` | `1,103,872` | `0753EC1E7A31847F252316D84C7767CE4E1F09346AF202644B2BCB26146AE2A9` |
+| `prebuilt/OptiScaler/plugins/cogpu_nr.asi` | `1,105,408` | `B55781162E24DB0D24413778069CDB5091B9094352F37F99CF41B83AB2ABA64E` |
 | `prebuilt/dlssnr_core.dll` | `6,035,547` | `89CBA727B4440EA99F74354DB866285C3498044DFB43EF8E905EF4ECAF617642` |
-| `prebuilt/standalone_ffx_proxy/amd_fidelityfx_upscaler_dx12.dll` | `1,072,640` | `12AC462372575BDB3D780D776E9C9C05943EEE0A4DC38BAA95AF2CF483E40592` |
+| `prebuilt/standalone_ffx_proxy/amd_fidelityfx_upscaler_dx12.dll` | `1,074,688` | `2D3FC915C8367F753DA91BAE64AC5A77D70C6F89F0A37BE3EF03F033EB0C6268` |
 
 ---
 

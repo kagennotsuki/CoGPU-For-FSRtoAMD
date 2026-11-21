@@ -10529,6 +10529,38 @@ static void MenuSectionNetwork009() {
     if (ImGui::Button("重读 [Network]")) { netLoad(); Log("菜单(0.0.9): 已按 dlssnr-amd.ini 重读网络配置"); }
     ImGui::Separator();
 }
+static void MenuSectionRuntimeForm() {
+    ImGui::TextDisabled("════ 当前运行形态与最终呈现显卡（F3 切换）════");
+    const bool isB = g_bformOn;
+    const bool nrActive = g_nrOn;
+    if (!isB) {
+        ImGui::TextColored(ImVec4(0.35f, 0.95f, 0.55f, 1.0f),
+                           "当前形态: A 形态（由【游戏卡】负责呈现最终画面）");
+        ImGui::TextDisabled("分工: 游戏卡渲染并合成最终帧输出 | 神经卡仅后台做 NR 推理 | NR 总开关(F10): %s",
+                            nrActive ? "开启" : "关闭");
+    } else {
+        ImGui::TextColored(ImVec4(0.45f, 0.85f, 1.0f, 1.0f),
+                           "当前形态: B 形态（由【神经卡】负责呈现最终画面）");
+        ImGui::TextDisabled("分工: %s | 阶段 Stage %d (%s) | NR 总开关(F10): %s",
+                            g_bform4k ? "B-4K 神经卡 DComp 独立覆盖" : "B 形态独立呈现",
+                            g_bformStage,
+                            g_bpReady ? "覆盖层已就绪" : "覆盖层准备中",
+                            nrActive ? "开启" : "关闭");
+    }
+    if (ImGui::Button(isB ? "切换到 A 形态（游戏卡呈现）" : "切换到 B 形态（神经卡呈现）")) {
+        std::string path = ModuleDir() + "xess_proxy.bform.txt";
+        const char* want = isB ? "0" : "9";
+        FILE* fb = nullptr;
+        if (fopen_s(&fb, path.c_str(), "w") == 0 && fb) { fwrite(want, 1, 1, fb); fclose(fb); }
+        Log("*** 菜单切换: 请求切换到 %s 形态（%s）***",
+            want[0] == '0' ? "A" : "B-4K",
+            want[0] == '0' ? "游戏卡负责呈现最终画面" : "神经卡负责呈现最终画面");
+    }
+    ImGui::SetItemTooltip("A 形态：由游戏卡合成并呈现最终画面；B 形态：由神经卡合成并通过独立 DComp 覆盖层呈现最终画面（等效 F3）");
+    ImGui::SameLine();
+    ImGui::TextDisabled("也可直接按 F3 热切换（约 1 秒生效）");
+    ImGui::Separator();
+}
 static void ProxyImGuiDraw(ID3D12GraphicsCommandList* cl, ID3D12Resource* rt, bool wmEligible,
                            D3D12_RESOURCE_STATES outputState) {
     if (!g_imguiInited || g_imguiFail || !rt) { return; }
@@ -10570,7 +10602,8 @@ static void ProxyImGuiDraw(ID3D12GraphicsCommandList* cl, ID3D12Resource* rt, bo
         ImGui::SetNextWindowSize(ImVec2(900, 780), ImGuiCond_FirstUseEver);
         ImGui::Begin("跨卡 NR 参数（Del 关闭 · 鼠标操作 · 悬停看说明）", &g_menuVisible,
                      ImGuiWindowFlags_NoCollapse);   // 允许拖动(NoMove 未设)与缩放
-        // 第一、二部分代理后处理已关闭；保留网络参数控制、预处理和其余菜单。
+        // 第一、二部分代理后处理已关闭；保留当前运行形态显示、网络参数控制、预处理和其余菜单。
+        MenuSectionRuntimeForm();
         MenuSectionNetwork009();
         MenuSectionNrControls();
         MenuSectionPreprocess();
