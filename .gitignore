@@ -1,0 +1,24 @@
+# Build outputs
+out/
+build/
+bin/
+*.obj
+*.pdb
+*.exp
+*.lib
+*.ilk
+*.log
+
+# Huge upstream model packs / caches (users place locally per README)
+*.bin
+*.nrp
+*.cache
+aco-cache/
+model/
+shaders/
+
+# Editor / OS clutter
+.vs/
+.vscode/
+Thumbs.db
+Desktop.ini

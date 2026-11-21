@@ -1,0 +1,7 @@
+LIBRARY amd_fidelityfx_upscaler_dx12
+EXPORTS
+    ffxCreateContext
+    ffxDestroyContext
+    ffxDispatch
+    ffxQuery
+    ffxConfigure
