@@ -57,18 +57,18 @@ CoGPU-For-FSRtoAMD/
 
 ## 部署方法 / Installation (Cyberpunk 2077 / DX12 FSR Games)
 
-1. **准备上游组件（放进游戏 `.exe` 所在目录，例如 `Cyberpunk 2077\bin\x64\`）**：
-   - **OptiScaler（必须支持 `v10.0` ASI 插件机制）**：下载并在游戏中部署 [**OptiScaler Nightly (`v10.0.0-pre1` · 实测 `nightly-20261030` / commit `e7e3872d`)**](https://github.com/optiscaler/OptiScaler-nightly/releases/tag/nightly-20261030)（[上游主仓库](https://github.com/optiscaler/OptiScaler)，也已原样内置于 `DLSSNR-AMD v0.0.9` 官方压缩包内的 `optiscaler\release\` 目录），以 `dxgi.dll` 形式放入游戏目录并保留 `OptiScaler\` 子目录及超分后端 DLL。（旧版 `0.7.x` 稳定版菜单样式不同且缺少配套 ASI 宿主支持）。
-   - **模型与着色器包**：从 [**mochizuki0323 / DLSSNR-AMD v0.0.9 Releases**](https://gitlab.com/mochizuki0323/DLSSNR-AMD/-/releases) 获取（或按其说明从 `nvngx_dlssnr.dll` 提取）`dlssnr-amd\` 目录（含 `CC_*.bin`、`aco/`、`shaders/`）放入游戏目录。
-   - **清理旧残留**：确认游戏目录内**没有** ReShade `dxgi.dll`、`finalimg.addon64` 或官方单卡 `dlssnr-amd.asi`，且此前替换过游戏自带 `amd_fidelityfx_upscaler_dx12.dll` 的请先还原。
-2. **放入本仓库配置与二进制**：
-   - 将 `prebuilt/dlssnr_core.dll` 复制到游戏 `.exe` 同目录；
-   - 将 `prebuilt/OptiScaler/plugins/cogpu_nr.asi` 复制到 `<游戏目录>\OptiScaler\plugins\cogpu_nr.asi`；
-   - 将 `configs/` 下全部文件（`xess_proxy.*` 与 `dlssnr-amd.ini`）复制到游戏 `.exe` 同目录。
-3. **双卡与 OptiScaler 参数核对**：
-   - 在 **Windows 图形设置** 中将游戏主程序指定给**主渲染 GPU**（如 RX 7900 XT）；
-   - 编辑 `xess_proxy.gpu.txt` 指定**神经推理副卡 DeviceId**（预设为 `nr=dev:0x7550`，即 RX 9070 XT，可用 `dxdiag` 或设备管理器硬件 ID 确认 `DEV_XXXX`）；
-   - 编辑 `OptiScaler.ini` 确保开启 ASI 插件加载并避免与主插件重复 Hook：
+前置准备：**清理旧残留** —— 确认游戏 `.exe` 目录（如 `Cyberpunk 2077\bin\x64\`）内**没有**旧版 ReShade `dxgi.dll`、`finalimg.addon64` 或此前手工替换过的 `amd_fidelityfx_upscaler_dx12.dll`（如有请先还原游戏原版），并在 **Windows 图形设置** 中将游戏主程序指定给**主渲染显卡**（如 RX 7900 XT）。
+
+### 方式一：基于 `mochizuki DLSSNR-AMD 0.0.9` 一键安装（推荐，无需单独下载 OptiScaler）
+
+> `DLSSNR-AMD 0.0.9` 官方发行压缩包内已自带适配验证过的 `OptiScaler`（`v10.0.0-pre1 / nightly-20261030`）、配置与 `install.bat` 安装器。
+
+1. **用 mochizuki 安装器打底**：从 [**mochizuki0323 / DLSSNR-AMD v0.0.9 Releases**](https://gitlab.com/mochizuki0323/DLSSNR-AMD/-/releases) 下载 Windows 包并解压，运行 `install.bat`，按提示选择 **OptiScaler** 路线并导入你自备的 `nvngx_dlssnr.dll`，将游戏目标指向游戏 `.exe` 目录（会自动配齐 `dxgi.dll`、`OptiScaler\`、`dlssnr-amd\` 权重模型目录并启用 `LoadAsiPlugins=true`）。
+2. **删除单卡版插件（关键）**：进入 `<游戏目录>\OptiScaler\plugins\`，**删除单卡版 `dlssnr-amd.asi`**（必须删除，避免与本项目的跨卡插件冲突）。
+3. **覆盖本项目压缩包**：从本仓库 [**Releases**](https://github.com/kagennotsuki/CoGPU-For-FSRtoAMD/releases) 下载 `CoGPU-For-FSRtoAMD-*.zip`，解压覆盖到游戏 `.exe` 同目录（含 `dlssnr_core.dll`、`OptiScaler/plugins/cogpu_nr.asi` 及全套 `xess_proxy.*` / `dlssnr-amd.ini`）。
+4. **核对双卡与 OptiScaler 参数**：
+   - 打开 `xess_proxy.gpu.txt` 指定**神经推理副卡 DeviceId**（预设为 `nr=dev:0x7550`，即 RX 9070 XT，可用 `dxdiag` 或设备管理器硬件 ID 确认 `DEV_XXXX`）；
+   - 打开 `OptiScaler.ini` 确认以下三项（`LoadAsiPlugins=true` 已由安装器设置，请重点检查后两项）：
      ```ini
      [Plugins]
      LoadAsiPlugins=true
@@ -77,6 +77,12 @@ CoGPU-For-FSRtoAMD/
      [FrameGen]
      Enabled=false
      ```
+
+### 方式二：从 OptiScaler 仓库单独手工安装（仅当你想使用其它版本 OptiScaler 时）
+
+1. 从 [**OptiScaler Nightly (`v10.0.0-pre1` · 实测 `nightly-20261030` / commit `e7e3872d`)**](https://github.com/optiscaler/OptiScaler-nightly/releases/tag/nightly-20261030)（[上游主仓库](https://github.com/optiscaler/OptiScaler)；旧 `0.7.x` 稳定版菜单样式不同且缺少配套 ASI 宿主支持）下载后解压至游戏 `.exe` 目录，运行 `setup_windows.bat` 选择以 **`dxgi.dll`** 注入。
+2. 从 [**mochizuki0323 / DLSSNR-AMD v0.0.9 Releases**](https://gitlab.com/mochizuki0323/DLSSNR-AMD/-/releases) 提取或放入 `dlssnr-amd\` 模型与着色器目录（含 `CC_*.bin`、`aco/`、`shaders/`）。
+3. 解压覆盖本仓库 Release 压缩包，并按方式一步骤 4 核对 `xess_proxy.gpu.txt` 与 `OptiScaler.ini` 三项参数。
 
 ---
 
