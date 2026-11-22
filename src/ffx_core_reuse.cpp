@@ -858,6 +858,12 @@ static bool WorkerInit() {
 
     // mochizuki 是 Vulkan 后端：输入纹理与上传缓冲统一由 WorkerAllocNetResources() 按 kNetW×kNetH 创建
     if (!WorkerAllocNetResources()) return false;
+    if (g_backendNgx) {
+        W.modelApplied = g_modelSel;
+        W.ok = true;
+        Log("worker: NGX feature 18 后端初始化完成（不加载 LmxxfNrRuntime.dll）");
+        return true;
+    }
 
     std::string dir = ModuleDir();
     std::wstring pak(dir.begin(), dir.end()); pak += L"LmxxfNrRuntime.pak";
@@ -1971,7 +1977,7 @@ static void WorkerMain() {
         bool delivered = false;   // 本帧是否把答案交付给了 A（B 形态下恒为 false）
 
         // 模型切换：菜单/文件请求了不同模型 → 在本帧之前重建会话（旧会话出的帧已经交付，不打断 present）
-        if (W.modelApplied != g_modelSel) {
+        if (!g_backendNgx && W.modelApplied != g_modelSel) {
             int want = g_modelSel;
             Log("worker: 收到换模型请求（%s），开始重建会话", want ? "Original 71-block" : "Small 31-block");
             WorkerRebuildForModel(want);
