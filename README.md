@@ -67,7 +67,7 @@ CoGPU-For-FSRtoAMD/
 2. **删除单卡版插件（关键）**：进入 `<游戏目录>\OptiScaler\plugins\`，**删除单卡版 `dlssnr-amd.asi`**（必须删除，避免与本项目的跨卡插件冲突）。
 3. **覆盖本项目压缩包**：从本仓库 [**Releases**](https://github.com/kagennotsuki/CoGPU-For-FSRtoAMD/releases) 下载 `CoGPU-For-FSRtoAMD-*.zip`，解压覆盖到游戏 `.exe` 同目录（含 `dlssnr_core.dll`、`OptiScaler/plugins/cogpu_nr.asi` 及全套 `xess_proxy.*` / `dlssnr-amd.ini`）。
 4. **核对双卡与 OptiScaler 参数**：
-   - 打开 `xess_proxy.gpu.txt` 指定**神经推理副卡**（预设为 `nr=dev:0x7550`；插件会自动排除**游戏主卡 LUID** 与微软软件渲染器，**同型号双卡**亦可直接自动选中另一张副卡；也支持写 `nr=luid:<hi>:<lo>`、`nr=sub:<SubSysId>` 或 `nr=idx:<序号>` 精确指定，删掉该文件则按 RDNA4 → 最大显存 AMD 独显自动挑选）；
+   - `xess_proxy.gpu.txt` **默认已全部注释（纯自动识别）**：插件会自动排除**游戏主卡 LUID** 与微软软件渲染器，**同型号双卡**也能直接选中另一张副卡，一般无需修改；若机箱内有 3 张及以上独显想人工钉死某一张，再取消对应行注释（支持 `nr=dev:` / `nr=luid:<hi>:<lo>` / `nr=sub:<SubSysId>` / `nr=idx:<序号>`）；
    - 打开 `OptiScaler.ini` 确认以下三项（`LoadAsiPlugins=true` 已由安装器设置，请重点检查后两项）：
      ```ini
      [Plugins]

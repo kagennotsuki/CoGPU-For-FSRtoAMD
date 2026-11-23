@@ -1,1 +1,11 @@
-nr=dev:0x7550
+; CoGPU-For-FSRtoAMD neural GPU selection (optional)
+; Leave all lines commented for automatic GPU selection:
+;   - Skips the game rendering GPU (by LUID) and software adapters
+;   - Prefers discrete RDNA4 (0x75xx) -> highest-VRAM AMD dGPU -> other hardware GPU
+;   - Works for dual identical-model GPUs (e.g. dual 0x7550 / dual 0x7590) automatically
+;
+; Uncomment ONE line below only if you want to pin a specific neural GPU manually:
+; nr=dev:0x7550
+; nr=luid:00000000:00016E22
+; nr=sub:2435148C
+; nr=idx:1
