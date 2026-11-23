@@ -457,12 +457,13 @@ static volatile bool g_kDelayAuto = true;         // 保留字段：现在不再
 // Only when xess_proxy.backend.txt says "ngx". Missing file or anything else = today's behaviour.
 // The backend itself lives in ngx_f18_backend.cpp (load + hand over textures + Evaluate).
 extern "C" bool NgxBackendLoad(ID3D12Device* dev);
-extern "C" bool NgxBackendEnsure(ID3D12GraphicsCommandList* cl, unsigned w, unsigned h);
+extern "C" bool NgxBackendEnsure(ID3D12GraphicsCommandList* cl, unsigned w, unsigned h, DXGI_FORMAT fmt = DXGI_FORMAT_R8G8B8A8_UNORM);
 extern "C" bool NgxBackendEval(ID3D12GraphicsCommandList* cl, ID3D12Resource* color, ID3D12Resource* mv,
                                unsigned w, unsigned h, bool reset, float mvScaleX, float mvScaleY);
 extern "C" void NgxBackendSetControls(float intensity, unsigned style, float localTone,
                                       float localStruct, float skinStruct, unsigned useAutoMask);
 extern "C" void* NgxBackendOutput();
+extern "C" DXGI_FORMAT NgxBackendFormat();
 extern "C" bool  NgxBackendActive();
 static bool g_backendNgx = false;
 static volatile LONG  g_c4On = 0;                   // xess_proxy.c4.txt = 1 才跑（ProxyExecute init 读一次）
@@ -553,7 +554,7 @@ struct Worker {
     ID3D12CommandAllocator* curAl = nullptr;
     ComPtr<ID3D12Fence> fe; UINT64 fv = 0;
     ComPtr<ID3D12Fence> xferFe;   // 跨卡共享围栏（A 的 4K 拷贝完成 → B 解码前等它）
-    ComPtr<ID3D12Resource> color, up, rb, rbPriv;
+    ComPtr<ID3D12Resource> color, colorFp16, up, rb, rbPriv;
     ComPtr<ID3D12Resource> vel;   // NGX only: 1080p RG16F motion vectors (shared, the core imports it)
     D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp{}, fpPriv{};
     UINT64 bytes = 0, bytesPriv = 0;
@@ -566,6 +567,7 @@ struct Worker {
     int  modelApplied = -1;     // 当前会话对应哪个模型请求（1=Original, 0=Small）
     void* setControls = nullptr;   // MochizukiNrSetControls（不在 ApiTable 里，单独 GetProcAddress）
     D3D12_RESOURCE_STATES ngxColState = D3D12_RESOURCE_STATE_COMMON;
+    D3D12_RESOURCE_STATES ngxColFp16State = D3D12_RESOURCE_STATE_COMMON;
     D3D12_RESOURCE_STATES ngxMvState  = D3D12_RESOURCE_STATE_COMMON;
     ComPtr<ID3D12Resource> bMvZeroUp;
     UINT ngxMvDimW = 0, ngxMvDimH = 0;
@@ -741,10 +743,12 @@ static bool WorkerAllocNetResources() {
     // 所以这张输入纹理必须带 D3D12_HEAP_FLAG_SHARED；否则导入失败、首帧就卡住（本机实测现象）。
     W.color = MakeTex(W.dev.Get(), kNetW, kNetH, DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_STATE_COMMON, false, true);
     if (g_backendNgx) {
+        W.colorFp16 = MakeTex(W.dev.Get(), kNetW, kNetH, DXGI_FORMAT_R16G16B16A16_FLOAT, D3D12_RESOURCE_STATE_COMMON, false, true);
         W.vel = MakeTex(W.dev.Get(), kNetW, kNetH, DXGI_FORMAT_R16G16_FLOAT, D3D12_RESOURCE_STATE_COMMON, false, true);
-        Log("worker: MV texture (%ux%u RG16F shared) %s", kNetW, kNetH, W.vel ? "ready" : "FAILED -> MV not fed");
+        Log("worker: FP16 shared color (%s) | MV texture (%ux%u RG16F shared) %s",
+            W.colorFp16 ? "ready" : "FAILED", kNetW, kNetH, W.vel ? "ready" : "FAILED -> MV not fed");
     }
-    if (!W.color) { Log("worker: 纹理失败"); return false; }
+    if (!W.color || (g_backendNgx && !W.colorFp16)) { Log("worker: 纹理失败"); return false; }
     D3D12_RESOURCE_DESC cd = W.color->GetDesc();
     D3D12_RESOURCE_DESC plain = cd; plain.Flags = D3D12_RESOURCE_FLAG_NONE;
     UINT rows = 0; UINT64 rs = 0, total = 0;
@@ -768,6 +772,7 @@ static bool WorkerAllocNetResources() {
     W.ansFrame.assign(K, -1);
     W.ansAGen.assign(K, -1);
     W.ngxColState = D3D12_RESOURCE_STATE_COMMON;
+    W.ngxColFp16State = D3D12_RESOURCE_STATE_COMMON;
     W.ngxMvState  = D3D12_RESOURCE_STATE_COMMON;
     W.bMvZeroUp.Reset();
     W.ngxMvDimW = W.ngxMvDimH = 0;
@@ -2173,10 +2178,14 @@ static void WorkerMain() {
                 a2Lease.Acquire({frameId, feedAGen, feedAResetEpoch}, W.q.Get(), W.color.Get(), W.vel.Get()) : nullptr;
             const bool useAInput = wantsA && (!A2In::requested || a2Source != nullptr);
             F9Id::Path f9ColorPath = F9Id::NoInputCopy, f9MvPath = F9Id::NoInputCopy;
+            const bool useFp16Ngx = (a2Source != nullptr && a2Token.slot && a2Token.slot->a3);
             if (a2Source) {
-                A2In::RecordWorkerCopies(W.cl.Get(), a2Source, W.color.Get(), W.vel.Get(),
-                                         W.ngxColState, W.ngxMvState);
-                W.ngxColState = W.ngxMvState = D3D12_RESOURCE_STATE_COMMON;
+                A2In::RecordWorkerCopies(W.cl.Get(), a2Source,
+                                         useFp16Ngx ? W.colorFp16.Get() : W.color.Get(), W.vel.Get(),
+                                         useFp16Ngx ? W.ngxColFp16State : W.ngxColState, W.ngxMvState);
+                if (useFp16Ngx) W.ngxColFp16State = D3D12_RESOURCE_STATE_COMMON;
+                else            W.ngxColState     = D3D12_RESOURCE_STATE_COMMON;
+                W.ngxMvState = D3D12_RESOURCE_STATE_COMMON;
                 f9ColorPath = f9MvPath = F9Id::A2Pair;
             } else if (useAInput) {
                 D3D12_TEXTURE_COPY_LOCATION cd{};
@@ -2231,7 +2240,12 @@ static void WorkerMain() {
                 Barrier(W.cl.Get(), W.vel.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON);
                 W.ngxMvState = D3D12_RESOURCE_STATE_COMMON;
             }
-            const bool ensureOk = !holdNoNew && NgxBackendEnsure(W.cl.Get(), kNetW, kNetH);
+            const DXGI_FORMAT wantNgxFmt = useFp16Ngx ? DXGI_FORMAT_R16G16B16A16_FLOAT : DXGI_FORMAT_R8G8B8A8_UNORM;
+            if (!holdNoNew && NgxBackendActive() && NgxBackendFormat() != wantNgxFmt) {
+                if (W.ngx[NgxReadback].lastFv) WaitWFence(W.ngx[NgxReadback].lastFv, kWorkerWaitMs);
+                if (W.ngx[NgxCompose].lastFv)  WaitWFence(W.ngx[NgxCompose].lastFv, kWorkerWaitMs);
+            }
+            const bool ensureOk = !holdNoNew && NgxBackendEnsure(W.cl.Get(), kNetW, kNetH, wantNgxFmt);
             if (W.ngxMvDimW != kNetW || W.ngxMvDimH != kNetH) {
                 W.ngxMvDimW = kNetW; W.ngxMvDimH = kNetH;
                 W.ngxMvX = (float)kNetW;
@@ -2260,9 +2274,10 @@ static void WorkerMain() {
             const bool skipEval = holdNoNew || (!bPrep && !freshA);
             const bool resetA = freshA && feedAGen != lastEvaluatedAGen;
             F9Id::WRecord f9Eval(W.cl.Get(), W.dev.Get(), f9Dispatch, feedAGen, feedAResetEpoch);
+            ID3D12Resource* ngxColorIn = useFp16Ngx ? W.colorFp16.Get() : W.color.Get();
             if (f9Eval.part && freshA && !skipEval && ensureOk) {
                 const auto audit = a3.a ? A3::Audit(*a3.a) : F9Id::A3Meta{};
-                f9Eval.Tap(F9Id::WColor, W.color.Get(), W.ngxColState, frameId, frameId, f9ColorPath, audit);
+                f9Eval.Tap(F9Id::WColor, ngxColorIn, useFp16Ngx ? W.ngxColFp16State : W.ngxColState, frameId, frameId, f9ColorPath, audit);
                 if (W.vel) f9Eval.Tap(F9Id::WMv, W.vel.Get(), W.ngxMvState, frameId,
                                       a2Source ? frameId : frameId + 1, f9MvPath, audit);
                 else F9Id::Count(F9Id::WMv, F9Id::NotProduced);
@@ -2270,11 +2285,12 @@ static void WorkerMain() {
                 F9Id::Count(F9Id::WColor, F9Id::NotProduced);
                 F9Id::Count(F9Id::WMv, F9Id::NotProduced);
             }
-            const bool evalOk = !skipEval && ensureOk && NgxBackendEval(W.cl.Get(), W.color.Get(), W.vel.Get(),
+            const bool evalOk = !skipEval && ensureOk && NgxBackendEval(W.cl.Get(), ngxColorIn, W.vel.Get(),
                                                            kNetW, kNetH, W.processed < 3 || resetA || resetReasons != 0,
                                                            W.ngxMvX, W.ngxMvY);
             if (evalOk) {   // the core samples colour/MV in place and leaves them shader-readable
-                W.ngxColState = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+                if (useFp16Ngx) W.ngxColFp16State = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+                else            W.ngxColState     = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
                 W.ngxMvState  = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
             }
             BtTrace("BPREP_END", frameId, "prep",
@@ -2325,7 +2341,7 @@ static void WorkerMain() {
                 F9Id::Transition(W.cl.Get(), a3.a->bufW.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST);
                 f9Answer.Tap(F9Id::WAnswer, po, D3D12_RESOURCE_STATE_COPY_SOURCE, frameId, frameId,
                              F9Id::Shared, A3::Audit(*a3.a));
-                const auto dst = A2In::Foot(a3.a->bufW.Get(), DXGI_FORMAT_R8G8B8A8_UNORM, 0);
+                const auto dst = A2In::Foot(a3.a->bufW.Get(), DXGI_FORMAT_R16G16B16A16_FLOAT, 0);
                 const auto src = A2In::Tex(po);
                 W.cl->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
                 F9Id::Transition(W.cl.Get(), a3.a->bufW.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON);
@@ -3281,6 +3297,27 @@ void TriCS(uint3 id : SV_DispatchThreadID)
     if (id.y == uint(h / 3) || id.y == uint(2 * h / 3)) gDst[id.xy] = float4(0.0,0.0,0.0,1.0);
 }
 
+float3 SrgbEnc(float3 v) {
+    v = saturate(v);
+    float3 a = 12.92 * v;
+    float3 b = 1.055 * pow(max(v, 1e-8), 1.0 / 2.4) - 0.055;
+    return lerp(a, b, step(0.0031308, v));
+}
+float3 SrgbDec(float3 v) {
+    v = saturate(v);
+    float3 a = v / 12.92;
+    float3 b = pow((v + 0.055) / 1.055, 2.4);
+    return lerp(a, b, step(0.04045, v));
+}
+float3 HybridEnc(float3 v) {
+    v = clamp(v, 0.0, 1000.0);
+    float m = max(v.r, max(v.g, v.b));
+    if (m <= 0.75) return v;
+    float e = (m - 0.75) * 4.0;
+    float h = 0.75 + 0.25 * (e * rsqrt(e * e + 1.0));
+    return v * (h / max(m, 1e-6));
+}
+
 // 小图 → 1080p（喂给网络）
 [numthreads(8,8,1)]
 void DownCS(uint3 id : SV_DispatchThreadID)
@@ -3312,7 +3349,13 @@ void DownCS(uint3 id : SV_DispatchThreadID)
     } else {
         c = gSrc.SampleLevel(gSmp, uv, 0);           // 放大或 1:1：双线性一次到位
     }
-    gDst[id.xy] = float4(PpApply(c.rgb, gEdge, gVarGain, gMvConf, gMvIdx, gGateK), 1.0);
+    if (gPadJ > 0.5) {
+        // A3 FP16 路径：可逆混合曲线（<=0.75 恒等，>0.75 无损压进 [0.75,1)）+ sRGB 编码
+        // 严格保证送进 Swin 网络的数据落在 [0,1] 显示域内，消除窗口浮点溢出闪烁与色偏
+        gDst[id.xy] = float4(SrgbEnc(HybridEnc(c.rgb)), 1.0);
+    } else {
+        gDst[id.xy] = float4(PpApply(c.rgb, gEdge, gVarGain, gMvConf, gMvIdx, gGateK), 1.0);
+    }
 }
 
 // 槽位原图 + 残差 → 合成后的 pColor
@@ -3351,7 +3394,24 @@ void ResidCS(uint3 id : SV_DispatchThreadID)
                  + gAns[c11.y * nw + c0.x] * w01 + gAns[c11.y * nw + c11.x] * w11;
         float4 f = gFed.Load(int3(c0, 0))  * w00 + gFed.Load(int3(c10, 0)) * w10
                  + gFed.Load(int3(c01, 0)) * w01 + gFed.Load(int3(c11, 0)) * w11;
-        e = (a.rgb - f.rgb);
+        if (gPadJ > 0.5) {
+            // 不做渐近线 HybridDec 反解（避免 m>2 时导数爆炸把高亮天空与亮边微抖动放大成刺眼白噪点）：
+            //   · <=0.75 主体区：HybridEnc 为 1:1 恒等，dHyb 即精确线性光残差
+            //   · >0.75 高亮区：按压缩域相对比例 dProp = c * (dHyb / fHyb) 回填，并在过曝区平滑收敛回原图
+            float3 aHyb = SrgbDec(a.rgb);
+            float3 fHyb = SrgbDec(f.rgb);
+            float3 dHyb = aHyb - fHyb;
+            float3 cHyb = HybridEnc(c.rgb);
+            float mF = max(fHyb.r, max(fHyb.g, fHyb.b));
+            float mC = max(cHyb.r, max(cHyb.g, cHyb.b));
+            float mRef = max(mF, mC);
+            float3 dProp = max(c.rgb, 0.0) * clamp(dHyb / max(fHyb, 0.125), -0.35, 0.35);
+            float wProp = smoothstep(0.65, 0.85, mRef);
+            float fadeHi = 1.0 - smoothstep(0.88, 0.99, mRef);
+            e = lerp(dHyb, dProp, wProp) * fadeHi;
+        } else {
+            e = (a.rgb - f.rgb);
+        }
     } else if (gSmooth < 0.05) {
         e = gRes.SampleLevel(gSmp, uv, 0).rgb - 0.5;
     } else {
@@ -3364,7 +3424,7 @@ void ResidCS(uint3 id : SV_DispatchThreadID)
     }
     // 代理后处理关闭：保留当前 NR 残差，不读取或混合历史。
 
-    float3 outc = saturate(c.rgb + e);
+    float3 outc = (gPadJ > 0.5) ? max(c.rgb + e, 0.0) : saturate(c.rgb + e);
 
 gDst[id.xy] = float4(outc, c.a);
 }
@@ -3417,10 +3477,10 @@ static void SetPass(ID3D12GraphicsCommandList* cl, ID3D12PipelineState* pso,
     EnsurePreprocessLoadedFromIni();
     float dj = g_dejitter ? (float)g_dejitterSign : 0.0f;
     float ppGain = (g_ppExpMode == 0) ? 1.0f : exp2f((float)g_ppBias);
-    float c[20] = { 1.0f, g_ppOn ? 1.0f : 0.0f, 0.0f, 1.0f, 1.0f, 1.0f, ppGain, 1.0f,
+    float c[20] = { 1.0f, (!a3Heap && g_ppOn) ? 1.0f : 0.0f, 0.0f, 1.0f, 1.0f, 1.0f, ppGain, 1.0f,
                     MvScaleUv(), (float)g_ppCurve, (float)g_ppContrast, (float)g_mvConfIdx,
                     (float)g_ppSat, (float)g_gateIdx, (a3Heap ? a3Bypass : g_bypass) ? 1.0f : 0.0f,
-                    (a3Heap || g_useGpuResid) ? 1.0f : 0.0f, g_curJitX, g_curJitY, dj, 0.0f };
+                    (a3Heap || g_useGpuResid) ? 1.0f : 0.0f, g_curJitX, g_curJitY, dj, a3Heap ? 1.0f : 0.0f };
     cl->SetComputeRoot32BitConstants(7, 20, c, 0);
     cl->Dispatch((w + 7) / 8, (h + 7) / 8, 1);
 }
@@ -8027,8 +8087,8 @@ static bool A2InitDirect() {
         if (A2In::S(p.gate.load()) != A2In::Free) continue;
         if (p.bufA && p.bufW && p.mirror && p.marker && p.prodA && p.prodW) { ++readySlots; continue; }
         newlyCreated[i] = true;
-        if (!MakeXBuf(2 * A2In::Plane(), "A2 direct pair", p.heapA, p.bufA, p.heapW, p.bufW) ||
-            !F9Id::Buffer(gNative.Get(), A2In::Plane() + sizeof(F9Id::Stamp), false, p.mirror) ||
+        if (!MakeXBuf(A2In::ColorPlane() + A2In::MvPlane(), "A2 direct pair", p.heapA, p.bufA, p.heapW, p.bufW) ||
+            !F9Id::Buffer(gNative.Get(), A2In::ColorPlane() + sizeof(F9Id::Stamp), false, p.mirror) ||
             !F9Id::Buffer(gNative.Get(), sizeof(F9Id::Stamp), true, p.marker)) { rollback(); return false; }
         auto hr = gNative->CreateFence(0, D3D12_FENCE_FLAG_SHARED | D3D12_FENCE_FLAG_SHARED_CROSS_ADAPTER,
                                        IID_PPV_ARGS(&p.prodA));
@@ -8384,7 +8444,7 @@ static bool RebuildNetResolution(UINT wantW, UINT wantH, ID3D12Resource* color,
     g_upBuf.Reset(); g_upBufW.Reset(); g_upHeap.Reset(); g_upHeapW.Reset();
     g_bDsReady = false; g_bDs1080.Reset();
     g_bCompReady = false; g_bState.Reset(); g_bStateCleared = false;
-    g_worker.color.Reset(); g_worker.vel.Reset();
+    g_worker.color.Reset(); g_worker.colorFp16.Reset(); g_worker.vel.Reset();
     g_worker.up.Reset(); g_worker.upPtr = nullptr;
     g_worker.bMvZeroUp.Reset(); g_worker.rbPriv.Reset(); g_worker.bytesPriv = 0;
 

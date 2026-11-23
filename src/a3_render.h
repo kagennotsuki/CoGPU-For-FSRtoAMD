@@ -49,7 +49,14 @@ static void Srv(const Input& p, UINT slot, ID3D12Resource* r) {
 }
 static void Uav(const Input& p, UINT slot, ID3D12Resource* r) {
     D3D12_UNORDERED_ACCESS_VIEW_DESC d{};
-    d.Format = r->GetDesc().Format; d.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+    d.Format = r->GetDesc().Format;
+    switch (d.Format) {
+    case DXGI_FORMAT_R16G16B16A16_TYPELESS: d.Format = DXGI_FORMAT_R16G16B16A16_FLOAT; break;
+    case DXGI_FORMAT_R16G16_TYPELESS: d.Format = DXGI_FORMAT_R16G16_FLOAT; break;
+    case DXGI_FORMAT_R8G8B8A8_TYPELESS: d.Format = DXGI_FORMAT_R8G8B8A8_UNORM; break;
+    default: break;
+    }
+    d.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
     g_dev->CreateUnorderedAccessView(r, nullptr, &d, Handle(p, slot));
 }
 static bool InitAnswerResources() { // main, only while the ring lock is held
@@ -101,14 +108,14 @@ static bool Prepare(Input& p, const AdapterFrameDesc& live) {
         p.fed.Reset(); p.packed.Reset(); p.localAnswer.Reset(); p.answerImage.Reset();
         p.netW = kNetW; p.netH = kNetH;
     }
-    if (!p.fed) p.fed = MakeTex(g_dev.Get(), kNetW, kNetH, DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_STATE_COMMON, true);
+    if (!p.fed) p.fed = MakeTex(g_dev.Get(), kNetW, kNetH, DXGI_FORMAT_R16G16B16A16_FLOAT, D3D12_RESOURCE_STATE_COMMON, true);
     if (!p.packed) p.packed = MakeTex(g_dev.Get(), kNetW, kNetH, DXGI_FORMAT_R16G16_FLOAT, D3D12_RESOURCE_STATE_COMMON, true);
     if (!p.localAnswer) {
         D3D12_RESOURCE_DESC b{}; b.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER; b.Width = Bytes();
         b.Height = b.DepthOrArraySize = b.MipLevels = b.SampleDesc.Count = 1; b.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
         p.localAnswer = FromDesc(b);
     }
-    if (g_bypass && !p.answerImage) p.answerImage = MakeTex(g_dev.Get(), kNetW, kNetH, DXGI_FORMAT_R8G8B8A8_UNORM,
+    if (g_bypass && !p.answerImage) p.answerImage = MakeTex(g_dev.Get(), kNetW, kNetH, DXGI_FORMAT_R16G16B16A16_FLOAT,
                                                             D3D12_RESOURCE_STATE_COMMON, false);
     if (!p.fed || !p.packed || !p.localAnswer || !p.composed || (g_bypass && !p.answerImage)) return false;
     if (!p.heap) {
@@ -122,9 +129,9 @@ static bool Prepare(Input& p, const AdapterFrameDesc& live) {
     if (p.answerImage) Srv(p, AnswerImage, p.answerImage.Get());
     Uav(p, FedUav, p.fed.Get()); Uav(p, MvUav, p.packed.Get()); Uav(p, ComposeUav, p.composed.Get());
     D3D12_SHADER_RESOURCE_VIEW_DESC sd{};
-    sd.Format = DXGI_FORMAT_R8G8B8A8_UNORM; sd.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+    sd.Format = DXGI_FORMAT_R16G16B16A16_FLOAT; sd.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
     sd.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-    sd.Buffer.NumElements = kNetW * kNetH;
+    sd.Buffer.NumElements = (A2In::ColorPitch() / 8u) * kNetH;
     g_dev->CreateShaderResourceView(p.localAnswer.Get(), &sd, Handle(p, LocalAnswer));
     d.hasUnsupportedExt = false; d.commandList = nullptr; d.output = {};
     p.desc = d;
@@ -235,7 +242,7 @@ static void Compose(ID3D12GraphicsCommandList* cl, Input& p, Answer& a, F9Id::AR
     if (bypass) {
         auto* img = p.answerImage.Get();
         Barrier(cl, img, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST);
-        const auto src = A2In::Foot(a.bufA.Get(), DXGI_FORMAT_R8G8B8A8_UNORM, 0);
+        const auto src = A2In::Foot(a.bufA.Get(), DXGI_FORMAT_R16G16B16A16_FLOAT, 0);
         const auto dst = A2In::Tex(img);
         cl->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
         Barrier(cl, img, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);

@@ -21,7 +21,7 @@ void Add4K(uint3 id : SV_DispatchThreadID)
     float4 o   = gSrc.Load(int3((int)id.x, (int)id.y, 0));
     float3 pre = gRes.SampleLevel(gSmp, uv, 0).rgb;
     float3 col = gMV.SampleLevel(gSmp, uv, 0).rgb;
-    gDst[id.xy] = float4(saturate(o.rgb + (pre - col)), o.a);
+    gDst[id.xy] = float4(max(o.rgb + (pre - col), 0.0), o.a);
 }
 
 // 备选：引导式 JBU（边缘更稳，但 8 次散读，实测 +4ms / -12fps）
@@ -56,5 +56,5 @@ void Add4K_JBU(uint3 id : SV_DispatchThreadID)
         }
     }
     float3 e4 = (wsum > 1e-4) ? (esum / wsum) : float3(0,0,0);
-    gDst[id.xy] = float4(saturate(o.rgb + e4), o.a);
+    gDst[id.xy] = float4(max(o.rgb + e4, 0.0), o.a);
 }

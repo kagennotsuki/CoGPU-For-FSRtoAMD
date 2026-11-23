@@ -107,6 +107,7 @@ static struct {
     void* handle = nullptr;
     ID3D12Resource* out = nullptr;     // answer texture (UAV)
     unsigned w = 0, h = 0;
+    DXGI_FORMAT fmt = DXGI_FORMAT_UNKNOWN;
     bool tried = false, ok = false;
     float intensity = 1.0f;
     unsigned style = 0u;
@@ -117,14 +118,14 @@ static struct {
 } g_nb;
 
 // ------------------------------------------------------------------ helpers
-static ID3D12Resource* NgxMakeAnswerTex(ID3D12Device* dev, unsigned w, unsigned h) {
+static ID3D12Resource* NgxMakeAnswerTex(ID3D12Device* dev, unsigned w, unsigned h, DXGI_FORMAT fmt) {
     D3D12_HEAP_PROPERTIES hp{};
     hp.Type = D3D12_HEAP_TYPE_DEFAULT;
     hp.CreationNodeMask = 1; hp.VisibleNodeMask = 1;
     D3D12_RESOURCE_DESC td{};
     td.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
     td.Width = w; td.Height = h; td.DepthOrArraySize = 1; td.MipLevels = 1;
-    td.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    td.Format = fmt;
     td.SampleDesc.Count = 1;
     td.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
     // must allow UAV: the core writes the answer with a UAV (measured; without it the device is removed)
@@ -134,7 +135,7 @@ static ID3D12Resource* NgxMakeAnswerTex(ID3D12Device* dev, unsigned w, unsigned 
     HRESULT hr = dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_SHARED, &td,
                                               D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&r));
     if (FAILED(hr)) {
-        NgxLog("!! answer texture failed 0x%08X (shared+UAV)", (unsigned)hr);
+        NgxLog("!! answer texture failed 0x%08X (fmt=%d shared+UAV)", (unsigned)hr, (int)fmt);
         return nullptr;
     }
     return r;
@@ -219,19 +220,20 @@ extern "C" bool NgxBackendLoad(ID3D12Device* dev) {
 }
 
 // cl must be an OPEN command list (CreateFeature takes the device from it)
-extern "C" bool NgxBackendEnsure(ID3D12GraphicsCommandList* cl, unsigned w, unsigned h) {
+extern "C" bool NgxBackendEnsure(ID3D12GraphicsCommandList* cl, unsigned w, unsigned h, DXGI_FORMAT fmt) {
     if (!g_nb.ok) return false;
-    if (g_nb.handle && g_nb.w == w && g_nb.h == h) return true;
-    if (g_nb.handle && (g_nb.w != w || g_nb.h != h)) {
+    if (g_nb.handle && g_nb.w == w && g_nb.h == h && g_nb.fmt == fmt) return true;
+    if (g_nb.handle && (g_nb.w != w || g_nb.h != h || g_nb.fmt != fmt)) {
         if (g_nb.Release) g_nb.Release(g_nb.handle);
         g_nb.handle = nullptr;
         if (g_nb.out) { g_nb.out->Release(); g_nb.out = nullptr; }
-        NgxLog("size changed -> rebuild feature (%ux%u)", w, h);
+        g_nb.fmt = DXGI_FORMAT_UNKNOWN;
+        NgxLog("format/size changed -> rebuild feature (%ux%u fmt=%d)", w, h, (int)fmt);
     }
     if (!g_nb.out) {
-        g_nb.out = NgxMakeAnswerTex(g_nb.dev, w, h);
+        g_nb.out = NgxMakeAnswerTex(g_nb.dev, w, h, fmt);
         if (!g_nb.out) return false;
-        NgxLog("answer texture ready %ux%u RGBA8 shared+UAV", w, h);
+        NgxLog("answer texture ready %ux%u fmt=%d shared+UAV", w, h, (int)fmt);
     }
     NgxParam* P = g_nb.params;
     NbSetU(P, "DLSSNR.Enabled", 1u);
@@ -245,10 +247,10 @@ extern "C" bool NgxBackendEnsure(ID3D12GraphicsCommandList* cl, unsigned w, unsi
 
     void* hnd = nullptr;
     const int rc = g_nb.Create(cl, 18, g_nb.params, &hnd);
-    NgxLog("CreateFeature(18) -> 0x%X handle=%p (%ux%u)", (unsigned)rc, hnd, w, h);
+    NgxLog("CreateFeature(18) -> 0x%X handle=%p (%ux%u fmt=%d)", (unsigned)rc, hnd, w, h, (int)fmt);
     if (rc != NGX_OK || !hnd) { g_nb.ok = false; return false; }
     g_nb.handle = hnd;
-    g_nb.w = w; g_nb.h = h;
+    g_nb.w = w; g_nb.h = h; g_nb.fmt = fmt;
     return true;
 }
 
@@ -334,6 +336,7 @@ extern "C" void NgxBackendSetControls(float intensity, unsigned style, float loc
 }
 
 extern "C" void* NgxBackendOutput() { return (void*)g_nb.out; }
+extern "C" DXGI_FORMAT NgxBackendFormat() { return g_nb.fmt; }
 extern "C" bool  NgxBackendActive() { return g_nb.ok && g_nb.handle != nullptr; }
 
 extern "C" void NgxBackendShutdown() {

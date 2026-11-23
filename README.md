@@ -119,9 +119,9 @@ powershell -ExecutionPolicy Bypass -File .\scripts\build_ffx_proxy.ps1
 
 | 文件 | 大小 (Bytes) | SHA256 |
 |---|---:|---|
-| `prebuilt/OptiScaler/plugins/cogpu_nr.asi` | `1,105,920` | `CD7D49CA9AB12B085C1D19D1023656243BDD49AA058C2A5C8BA2D2FA487D9471` |
+| `prebuilt/OptiScaler/plugins/cogpu_nr.asi` | `1,108,480` | `CF1EAC96BD0CDB8D564773B129C45A40863BA1BD5095AAB58C39DB6E5EE7C938` |
 | `prebuilt/dlssnr_core.dll` | `6,035,547` | `89CBA727B4440EA99F74354DB866285C3498044DFB43EF8E905EF4ECAF617642` |
-| `prebuilt/standalone_ffx_proxy/amd_fidelityfx_upscaler_dx12.dll` | `1,074,688` | `FD751E8D605583F27B731111BD96BE6C60A229983F99F5270C2726362F0D70EB` |
+| `prebuilt/standalone_ffx_proxy/amd_fidelityfx_upscaler_dx12.dll` | `1,077,760` | `711DF6403D6D7A02DEC20E675EF172DBE16BAF62F81185492E6DC2226315620D` |
 
 ---
 

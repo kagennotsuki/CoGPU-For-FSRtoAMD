@@ -4,8 +4,18 @@
 #include <condition_variable>
 
 namespace A2In {
-static inline UINT Pitch() { return kNetW * 4u; }
-static inline UINT64 Plane() { return UINT64(Pitch()) * UINT64(kNetH); }
+static inline UINT ColorPitch() { return ((kNetW * 8u) + 255u) & ~255u; }
+static inline UINT64 ColorPlane() { return UINT64(ColorPitch()) * UINT64(kNetH); }
+static inline UINT MvPitch() { return ((kNetW * 4u) + 255u) & ~255u; }
+static inline UINT64 MvPlane() { return UINT64(MvPitch()) * UINT64(kNetH); }
+static inline UINT Pitch() { return MvPitch(); }
+static inline UINT64 Plane() { return ColorPlane(); }
+static inline UINT PitchFor(DXGI_FORMAT fmt) {
+    return (fmt == DXGI_FORMAT_R16G16B16A16_FLOAT) ? ColorPitch() : MvPitch();
+}
+static inline UINT64 PlaneFor(DXGI_FORMAT fmt) {
+    return UINT64(PitchFor(fmt)) * UINT64(kNetH);
+}
 struct Key { int frame = -1, gen = -1; UINT64 epoch = 0; };
 static bool Equal(Key a, Key b) { return a.frame == b.frame && a.gen == b.gen && a.epoch == b.epoch; }
 enum State : UINT64 { Free, Recording, Sealed, Calling, Ready, Mirroring, Offered, Leased, Retiring, Dropped, Dead, A3Held };
@@ -103,7 +113,7 @@ static void ReleaseSlotBuffers(Slot& p) {
 static D3D12_TEXTURE_COPY_LOCATION Foot(ID3D12Resource* backing, DXGI_FORMAT fmt, UINT64 offset) {
     D3D12_TEXTURE_COPY_LOCATION l{};
     l.pResource = backing; l.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
-    l.PlacedFootprint = {offset, {fmt, kNetW, kNetH, 1, Pitch()}};
+    l.PlacedFootprint = {offset, {fmt, kNetW, kNetH, 1, PitchFor(fmt)}};
     return l;
 }
 static D3D12_TEXTURE_COPY_LOCATION Tex(ID3D12Resource* t) {
@@ -113,8 +123,9 @@ static D3D12_TEXTURE_COPY_LOCATION Tex(ID3D12Resource* t) {
 static void RecordWorkerCopies(ID3D12GraphicsCommandList* cl, ID3D12Resource* source,
                                ID3D12Resource* color, ID3D12Resource* mv,
                                D3D12_RESOURCE_STATES colorState, D3D12_RESOURCE_STATES mvState) {
-    auto cs = Foot(source, DXGI_FORMAT_R8G8B8A8_UNORM, 0);
-    auto vs = Foot(source, DXGI_FORMAT_R16G16_FLOAT, Plane());
+    const DXGI_FORMAT cFmt = color->GetDesc().Format;
+    auto cs = Foot(source, cFmt, 0);
+    auto vs = Foot(source, DXGI_FORMAT_R16G16_FLOAT, PlaneFor(cFmt));
     auto cd = Tex(color), vd = Tex(mv);
     F9Id::Transition(cl, source, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE);
     F9Id::Transition(cl, color, colorState, D3D12_RESOURCE_STATE_COPY_DEST);
@@ -201,7 +212,7 @@ struct Lease {
     }
 };
 static bool StampMatches(Slot& p) {
-    const UINT64 pl = Plane();
+    const UINT64 pl = p.a3 ? ColorPlane() : MvPlane();
     const D3D12_RANGE range{SIZE_T(pl), SIZE_T(pl + sizeof(F9Id::Stamp))};
     void* ptr = nullptr;
     if (FAILED(p.mirror->Map(0, &range, &ptr)) || !ptr) { ++mirrorFail; return false; }
@@ -281,7 +292,7 @@ static void DiagReap(Slot& p, int dispatch, UINT64 a, UINT64 w, UINT64 worker, S
 }
 
 static Token Offer(Key key, BYTE* rgb, size_t rgbBytes, int dispatch = -1) {
-    const UINT64 pl = Plane();
+    const UINT64 pl = UINT64(kNetW) * UINT64(kNetH) * 4ull;
     if (!initialized.load() || broken.load() || !rgb || rgbBytes != pl) {
         DiagOfferNone(key, dispatch, "lane_or_mirror_unavailable");
         return {};
@@ -470,10 +481,11 @@ struct Producer {
         // Sources already COPY_SOURCE; neither data nor marker can be published
         // separately. This list also records the local color/MV capture.
         auto srcC = Tex(color), srcM = Tex(mv);
-        const UINT64 pl = Plane();
-        auto dc = Foot(p->bufA.Get(), DXGI_FORMAT_R8G8B8A8_UNORM, 0);
+        const DXGI_FORMAT cFmt = p->a3 ? DXGI_FORMAT_R16G16B16A16_FLOAT : DXGI_FORMAT_R8G8B8A8_UNORM;
+        const UINT64 pl = PlaneFor(cFmt);
+        auto dc = Foot(p->bufA.Get(), cFmt, 0);
         auto dm = Foot(p->bufA.Get(), DXGI_FORMAT_R16G16_FLOAT, pl);
-        auto cpu = Foot(p->mirror.Get(), DXGI_FORMAT_R8G8B8A8_UNORM, 0);
+        auto cpu = Foot(p->mirror.Get(), cFmt, 0);
         F9Id::Transition(cl, p->bufA.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST);
         cl->CopyTextureRegion(&dc, 0, 0, 0, &srcC, nullptr);
         cl->CopyTextureRegion(&dm, 0, 0, 0, &srcM, nullptr);
