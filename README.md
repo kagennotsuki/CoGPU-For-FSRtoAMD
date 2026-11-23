@@ -67,7 +67,7 @@ CoGPU-For-FSRtoAMD/
 2. **删除单卡版插件（关键）**：进入 `<游戏目录>\OptiScaler\plugins\`，**删除单卡版 `dlssnr-amd.asi`**（必须删除，避免与本项目的跨卡插件冲突）。
 3. **覆盖本项目压缩包**：从本仓库 [**Releases**](https://github.com/kagennotsuki/CoGPU-For-FSRtoAMD/releases) 下载 `CoGPU-For-FSRtoAMD-*.zip`，解压覆盖到游戏 `.exe` 同目录（含 `dlssnr_core.dll`、`OptiScaler/plugins/cogpu_nr.asi` 及全套 `xess_proxy.*` / `dlssnr-amd.ini`）。
 4. **核对双卡与 OptiScaler 参数**：
-   - 打开 `xess_proxy.gpu.txt` 指定**神经推理副卡 DeviceId**（预设为 `nr=dev:0x7550`，即 RX 9070 XT，可用 `dxdiag` 或设备管理器硬件 ID 确认 `DEV_XXXX`）；
+   - 打开 `xess_proxy.gpu.txt` 指定**神经推理副卡**（预设为 `nr=dev:0x7550`；插件会自动排除**游戏主卡 LUID** 与微软软件渲染器，**同型号双卡**亦可直接自动选中另一张副卡；也支持写 `nr=luid:<hi>:<lo>`、`nr=sub:<SubSysId>` 或 `nr=idx:<序号>` 精确指定，删掉该文件则按 RDNA4 → 最大显存 AMD 独显自动挑选）；
    - 打开 `OptiScaler.ini` 确认以下三项（`LoadAsiPlugins=true` 已由安装器设置，请重点检查后两项）：
      ```ini
      [Plugins]
@@ -119,9 +119,9 @@ powershell -ExecutionPolicy Bypass -File .\scripts\build_ffx_proxy.ps1
 
 | 文件 | 大小 (Bytes) | SHA256 |
 |---|---:|---|
-| `prebuilt/OptiScaler/plugins/cogpu_nr.asi` | `1,108,480` | `CF1EAC96BD0CDB8D564773B129C45A40863BA1BD5095AAB58C39DB6E5EE7C938` |
+| `prebuilt/OptiScaler/plugins/cogpu_nr.asi` | `1,111,040` | `3FCDE8B21A6B2AB3323E49E610673A3939C2E5653AFDCD5FBD3F123B5A3F9C7F` |
 | `prebuilt/dlssnr_core.dll` | `6,035,547` | `89CBA727B4440EA99F74354DB866285C3498044DFB43EF8E905EF4ECAF617642` |
-| `prebuilt/standalone_ffx_proxy/amd_fidelityfx_upscaler_dx12.dll` | `1,077,760` | `711DF6403D6D7A02DEC20E675EF172DBE16BAF62F81185492E6DC2226315620D` |
+| `prebuilt/standalone_ffx_proxy/amd_fidelityfx_upscaler_dx12.dll` | `1,080,320` | `E1820EDD56FDD500FC4C6752ACCE6AA9A0308ABF07F8926FED36208346D1429C` |
 
 ---
 

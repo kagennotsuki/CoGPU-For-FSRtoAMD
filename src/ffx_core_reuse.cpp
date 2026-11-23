@@ -779,47 +779,112 @@ static bool WorkerAllocNetResources() {
     return true;
 }
 
-static bool WorkerInit() {
+static bool WorkerInit(ID3D12Device* gameDev) {
     Worker& W = g_worker;
     ComPtr<IDXGIFactory6> fac;
     if (FAILED(CreateDXGIFactory2(0, IID_PPV_ARGS(fac.GetAddressOf())))) return false;
     ComPtr<IDXGIAdapter1> ad;
-    {   // 运行时要求 D3D12 设备与 HIP 设备同卡
-        // ★ 可选：安装器写入的神经卡选择。支持两种写法：
-        //     nr=dev:7550                 按 PCI DeviceId（安装器用这种，简单可靠）
-        //     nr=luid:00000000:0001A2B3   按 LUID（同名双卡时更精确）
-        //   文件不存在 / 解析失败 / 不匹配 → 完全回落到原有自动选择（0x7550 → 序数 1）
-        LUID wantLuid{}; bool haveWant = false; bool haveWantDev = false;
+    {   // 选卡策略：支持 nr=dev:<DeviceId> / nr=luid:<hi>:<lo> / nr=sub:<SubSysId> / nr=idx:<序号>
+        // 关键：必须排除游戏主卡 LUID 与软件渲染器，否则同型号双卡（如两张 0x7550）必撞回游戏卡自己
+        const LUID gameLuid = gameDev ? gameDev->GetAdapterLuid() : LUID{};
+        const bool haveGameLuid = (gameDev != nullptr);
+        auto sameLuid = [](const LUID& a, const LUID& b) -> bool {
+            return (a.HighPart == b.HighPart) && (a.LowPart == b.LowPart);
+        };
+
+        LUID wantLuid{}; bool haveWantLuid = false; bool haveWantDev = false;
+        unsigned int wantSub = 0; bool haveWantSub = false;
+        unsigned int wantIdx = 0; bool haveWantIdx = false;
         {
             std::string gp = ModuleDir() + "xess_proxy.gpu.txt";
             FILE* gf = nullptr;
             if (fopen_s(&gf, gp.c_str(), "r") == 0 && gf) {
-                unsigned long long hi = 0, lo = 0;
-                unsigned int wantDev = 0;
-                int gotDev = fscanf_s(gf, "nr=dev:%x", &wantDev);
-                if (gotDev == 1 && wantDev) { g_wantDevId = wantDev; haveWantDev = true; }
-                else if (fscanf_s(gf, "nr=luid:%llx:%llx", &hi, &lo) == 2) {
-                    wantLuid.HighPart = (LONG)hi; wantLuid.LowPart = (DWORD)lo; haveWant = true;
+                char line[128] = { 0 };
+                while (fgets(line, sizeof(line), gf)) {
+                    size_t len = strlen(line);
+                    while (len > 0 && (line[len - 1] == '\n' || line[len - 1] == '\r' || line[len - 1] == ' ' || line[len - 1] == '\t'))
+                        line[--len] = 0;
+                    const char* s = line;
+                    while (*s == ' ' || *s == '\t') ++s;
+                    if (!*s || *s == ';' || *s == '#') continue;
+
+                    unsigned long long hi = 0, lo = 0;
+                    unsigned int v = 0;
+                    if (_strnicmp(s, "nr=luid:", 8) == 0 && sscanf_s(s + 8, "%llx:%llx", &hi, &lo) == 2) {
+                        wantLuid.HighPart = (LONG)hi; wantLuid.LowPart = (DWORD)lo; haveWantLuid = true; break;
+                    }
+                    if (_strnicmp(s, "nr=dev:", 7) == 0 && sscanf_s(s + 7, "%x", &v) == 1 && v) {
+                        g_wantDevId = v; haveWantDev = true; break;
+                    }
+                    if (_strnicmp(s, "nr=sub:", 7) == 0 && sscanf_s(s + 7, "%x", &v) == 1 && v) {
+                        wantSub = v; haveWantSub = true; break;
+                    }
+                    if (_strnicmp(s, "nr=idx:", 7) == 0 && sscanf_s(s + 7, "%u", &v) == 1) {
+                        wantIdx = v; haveWantIdx = true; break;
+                    }
                 }
                 fclose(gf);
                 if (haveWantDev) Log("worker: 读到安装器的神经卡选择 DeviceId=0x%04X", g_wantDevId);
-                else if (haveWant) Log("worker: 读到安装器的神经卡选择 LUID=%08X:%08X", (unsigned)wantLuid.HighPart, (unsigned)wantLuid.LowPart);
+                else if (haveWantLuid) Log("worker: 读到安装器的神经卡选择 LUID=%08X:%08X", (unsigned)wantLuid.HighPart, (unsigned)wantLuid.LowPart);
+                else if (haveWantSub) Log("worker: 读到安装器的神经卡选择 SubSysId=0x%08X", wantSub);
+                else if (haveWantIdx) Log("worker: 读到安装器的神经卡选择 AdapterIdx=%u", wantIdx);
             }
         }
-        ComPtr<IDXGIAdapter1> best, fallback;
+
+        const unsigned int targetDev = haveWantDev ? g_wantDevId : 0x7550u;
+        ComPtr<IDXGIAdapter1> explicitPick;
+        ComPtr<IDXGIAdapter1> bestDiffTargetDev;
+        ComPtr<IDXGIAdapter1> bestDiffRdna4;
+        ComPtr<IDXGIAdapter1> bestDiffAmd; UINT64 bestDiffAmdVram = 0;
+        ComPtr<IDXGIAdapter1> bestDiffHw;  UINT64 bestDiffHwVram  = 0;
+        ComPtr<IDXGIAdapter1> fallbackSameTarget;
+        ComPtr<IDXGIAdapter1> fallbackSameAny;
+
         for (UINT i = 0; i < 8; ++i) {
             ComPtr<IDXGIAdapter1> a1;
             if (fac->EnumAdapters1(i, a1.GetAddressOf()) != S_OK) break;
-            DXGI_ADAPTER_DESC dd{};
-            a1->GetDesc(&dd);
-            Log("  worker 候选[%u] = %ls  DeviceId=0x%04X", i, dd.Description, dd.DeviceId);
-            if (haveWantDev) { if (dd.DeviceId == g_wantDevId && !best) best = a1; }
-            else if (haveWant && (dd.AdapterLuid.HighPart == wantLuid.HighPart) && (dd.AdapterLuid.LowPart == wantLuid.LowPart)) best = a1;
-            else if (!haveWant && dd.DeviceId == 0x7550 && !best) best = a1;   // 未指定时按 DeviceId（0x7550 = RX 9070 XT）
-        // 不再按名字兜底：显卡可被改名，只有 DeviceId 可靠（0x7550 = Navi48 / RX 9070 XT）
-            if (i == 1 && !fallback) fallback = a1;
+            DXGI_ADAPTER_DESC1 dd{};
+            a1->GetDesc1(&dd);
+            const bool isSw = ((dd.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) != 0) ||
+                              (dd.VendorId == 0x1414 && dd.DeviceId == 0x008C);
+            const bool isGame = haveGameLuid && sameLuid(dd.AdapterLuid, gameLuid);
+            Log("  worker 候选[%u] = %ls  Ven=0x%04X Dev=0x%04X Sub=0x%08X VRAM=%lluMB LUID=%08X:%08X%s%s",
+                i, dd.Description, dd.VendorId, dd.DeviceId, dd.SubSysId,
+                (unsigned long long)(dd.DedicatedVideoMemory >> 20),
+                (unsigned)dd.AdapterLuid.HighPart, (unsigned)dd.AdapterLuid.LowPart,
+                isGame ? " [游戏卡]" : "", isSw ? " [软件]" : "");
+
+            if (haveWantLuid && sameLuid(dd.AdapterLuid, wantLuid) && !explicitPick) {
+                explicitPick = a1;
+            } else if (haveWantIdx && i == wantIdx && !isSw && !explicitPick) {
+                explicitPick = a1;
+            } else if (haveWantSub && dd.SubSysId == wantSub && !isSw && !isGame && !explicitPick) {
+                explicitPick = a1;
+            }
+            if (isSw) continue;
+
+            if (!isGame) {
+                if (dd.DeviceId == targetDev && !bestDiffTargetDev) bestDiffTargetDev = a1;
+                if (dd.VendorId == 0x1002 && (dd.DeviceId & 0xFF00u) == 0x7500u && !bestDiffRdna4) bestDiffRdna4 = a1;
+                if (dd.VendorId == 0x1002 && (!bestDiffAmd || dd.DedicatedVideoMemory > bestDiffAmdVram)) {
+                    bestDiffAmd = a1; bestDiffAmdVram = (UINT64)dd.DedicatedVideoMemory;
+                }
+                if (!bestDiffHw || dd.DedicatedVideoMemory > bestDiffHwVram) {
+                    bestDiffHw = a1; bestDiffHwVram = (UINT64)dd.DedicatedVideoMemory;
+                }
+            } else {
+                if (dd.DeviceId == targetDev && !fallbackSameTarget) fallbackSameTarget = a1;
+                if (!fallbackSameAny) fallbackSameAny = a1;
+            }
         }
-        ad = best ? best : fallback;
+
+        if (explicitPick) ad = explicitPick;
+        else if (bestDiffTargetDev) ad = bestDiffTargetDev;
+        else if (bestDiffRdna4) ad = bestDiffRdna4;
+        else if (bestDiffAmd) ad = bestDiffAmd;
+        else if (bestDiffHw) ad = bestDiffHw;
+        else if (fallbackSameTarget) ad = fallbackSameTarget;
+        else ad = fallbackSameAny;
     }
     if (!ad) { Log("worker: 找不到适配器"); return false; }
     if (FAILED(D3D12CreateDevice(ad.Get(), D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(W.dev.GetAddressOf())))) {
@@ -829,7 +894,9 @@ static bool WorkerInit() {
         DXGI_ADAPTER_DESC dc{};
         ad->GetDesc(&dc);
         g_workerDevId = (unsigned int)dc.DeviceId;   // ★ D1：只记账，不参与任何选择逻辑
-        Log("worker: 使用 %ls", dc.Description);
+        Log("worker: 使用 %ls (Dev=0x%04X LUID=%08X:%08X)",
+            dc.Description, dc.DeviceId,
+            (unsigned)dc.AdapterLuid.HighPart, (unsigned)dc.AdapterLuid.LowPart);
     }
     D3D12_COMMAND_QUEUE_DESC qd{};
     W.dev->CreateCommandQueue(&qd, IID_PPV_ARGS(W.q.GetAddressOf()));
@@ -8670,7 +8737,7 @@ extern "C" int ProxyExecute(void* ctx, void* cmdList, const void* params, float 
             ComputeNetDims((int)g_nrScaleMode, (UINT)cdInit.Width, cdInit.Height, kNetW, kNetH);
             Log("启动 NR 推理尺寸: %ux%u (nr_scale_mode=%d)", kNetW, kNetH, (int)g_nrScaleMode);
         }
-        if (!BuildResources(g_dev.Get(), color, mvRes, depRes, outp) || !WorkerInit()) {
+        if (!BuildResources(g_dev.Get(), color, mvRes, depRes, outp) || !WorkerInit(g_dev.Get())) {
             gaveUp = true; Log("!! 初始化失败，永久放弃"); return real ? real(ctx, cmdList, params) : errRc;
         }
         {   // Present 钩子：取最终画面（tonemap + UI 之后）作底图的开关
