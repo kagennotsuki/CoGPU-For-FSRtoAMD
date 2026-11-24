@@ -4240,7 +4240,10 @@ static void DumpFlush(int st) {
 }
 // 记在游戏的命令列表上：三张图 → 当前槽
 static void BformCopy(ID3D12GraphicsCommandList* cl, ID3D12Resource* color,
-                      ID3D12Resource* mv, ID3D12Resource* dep, float jx, float jy) {
+                      ID3D12Resource* mv, ID3D12Resource* dep, float jx, float jy,
+                      D3D12_RESOURCE_STATES colorState = D3D12_RESOURCE_STATE_COMMON,
+                      D3D12_RESOURCE_STATES mvState    = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+                      D3D12_RESOURCE_STATES depState   = D3D12_RESOURCE_STATE_DEPTH_READ) {
     if (!g_bformOn || !g_bformReady || !cl || !color || !mv || !dep) return;
     // 槽位按【帧号】索引（K 槽）：B 处理第 N 帧时去读 N%K，不会被后来的帧覆盖
     const UINT64 base = (UINT64)(g_frame % K) * g_upSlotBytes;
@@ -4266,16 +4269,12 @@ static void BformCopy(ID3D12GraphicsCommandList* cl, ID3D12Resource* color,
         cl->CopyTextureRegion(&dst, 0, 0, 0, &s, nullptr);
         Barrier(cl, src, D3D12_RESOURCE_STATE_COPY_SOURCE, back);
     };
-    // 状态与 ③ 步捕获槽位时完全一致（照抄，避免又多一种状态假设）
     if (!g_xferOwn)   // 颜色由我们自己的 COPY 队列拷（见 XferKickColor），这里只拷 MV/深度
-        one(color, g_upFmtC, g_upW, g_upH, g_upPitchC, g_upOffC,
-        D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COMMON);
+        one(color, g_upFmtC, g_upW, g_upH, g_upPitchC, g_upOffC, colorState, colorState);
     if (g_upMw && g_upMh)
-        one(mv, g_upFmtM, g_upMw, g_upMh, g_upPitchM, g_upOffM,
-            D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+        one(mv, g_upFmtM, g_upMw, g_upMh, g_upPitchM, g_upOffM, mvState, mvState);
     if (g_upDw && g_upDh)
-        one(dep, g_upFmtD, g_upDw, g_upDh, g_upPitchD, g_upOffD,
-            D3D12_RESOURCE_STATE_DEPTH_READ, D3D12_RESOURCE_STATE_DEPTH_READ);
+        one(dep, g_upFmtD, g_upDw, g_upDh, g_upPitchD, g_upOffD, depState, depState);
 
     Barrier(cl, g_upBuf.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON);
 
@@ -8654,6 +8653,14 @@ extern "C" int ProxyExecute(void* ctx, void* cmdList, const void* params, float 
     ID3D12Resource* depRes = (ID3D12Resource*)q[2];
     ID3D12Resource* outp  = (ID3D12Resource*)q[5];
     g_outpRes = outp;                     // ★ 4K 后置模式要用（取 XeSS 上采样之后的画面）
+    const D3D12_RESOURCE_STATES colorState = (adapterDesc && adapterDesc->color.valid)
+        ? adapterDesc->color.state : D3D12_RESOURCE_STATE_COMMON;
+    const D3D12_RESOURCE_STATES mvState = (adapterDesc && adapterDesc->motionVectors.valid)
+        ? adapterDesc->motionVectors.state : D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+    const D3D12_RESOURCE_STATES depState = (adapterDesc && adapterDesc->depth.valid)
+        ? adapterDesc->depth.state : D3D12_RESOURCE_STATE_DEPTH_READ;
+    const D3D12_RESOURCE_STATES outState = (adapterDesc && adapterDesc->output.valid)
+        ? adapterDesc->output.state : D3D12_RESOURCE_STATE_COMMON;
     const auto bindCurrentOutpSrv = [&] {
         static ID3D12Resource* lastOutp = nullptr;
         static int lastBuildGen = -1;
@@ -9141,20 +9148,20 @@ extern "C" int ProxyExecute(void* ctx, void* cmdList, const void* params, float 
     // ---------- ③ [GPU] 拷本帧原始 pColor / MV / depth 进槽位 ----------
     if (!skipAPixels && aCaptureValid) {
         if (color) {
-            Barrier(cl, color, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE);
+            Barrier(cl, color, colorState, D3D12_RESOURCE_STATE_COPY_SOURCE);
             Barrier(cl, cur.color.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_DEST);
             cl->CopyResource(cur.color.Get(), color);
-            Barrier(cl, color, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON);
+            Barrier(cl, color, D3D12_RESOURCE_STATE_COPY_SOURCE, colorState);
         }
         if (mvRes && cur.mv) {
-            Barrier(cl, mvRes, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_SOURCE);
+            Barrier(cl, mvRes, mvState, D3D12_RESOURCE_STATE_COPY_SOURCE);
             cl->CopyResource(cur.mv.Get(), mvRes);
-            Barrier(cl, mvRes, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+            Barrier(cl, mvRes, D3D12_RESOURCE_STATE_COPY_SOURCE, mvState);
         }
         if (depRes && cur.depth) {
-            Barrier(cl, depRes, D3D12_RESOURCE_STATE_DEPTH_READ, D3D12_RESOURCE_STATE_COPY_SOURCE);
+            Barrier(cl, depRes, depState, D3D12_RESOURCE_STATE_COPY_SOURCE);
             cl->CopyResource(cur.depth.Get(), depRes);
-            Barrier(cl, depRes, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_DEPTH_READ);
+            Barrier(cl, depRes, D3D12_RESOURCE_STATE_COPY_SOURCE, depState);
         }
         cur.jx = jx; cur.jy = jy; cur.frame = N; cur.captured = true;
     }
@@ -9179,12 +9186,12 @@ extern "C" int ProxyExecute(void* ctx, void* cmdList, const void* params, float 
                 Log("NGX: MV source bound (SRV) %ux%u fmt=%d", (UINT)md0.Width, md0.Height, (int)md0.Format);
             }
         }
-        Barrier(cl, mvRes, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        Barrier(cl, mvRes, mvState, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
         Barrier(cl, g_mvPacked.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
         SetPass(cl, g_psoMvPack.Get(), kSrvMvCur, kSrvMvCur, kSrvMvCur, kSrvMvCur, kSrvMvCur,
                 kSrvMvPacked, kSrvMvPacked, kNetW, kNetH);
         Barrier(cl, g_mvPacked.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
-        Barrier(cl, mvRes, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+        Barrier(cl, mvRes, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, mvState);
         D3D12_TEXTURE_COPY_LOCATION vd{};
         vd.pResource = g_xBufVel.Get();
         vd.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
@@ -9209,7 +9216,7 @@ extern "C" int ProxyExecute(void* ctx, void* cmdList, const void* params, float 
     if (g_bformOn && g_bformReady && color && mvRes && depRes) {
         if (g_mvPackReady && g_psoMvPack) {
             // 先把 MV 打包成 1080p RG16F（29.5MB → 8.3MB），再把打包结果传过去
-            Barrier(cl, mvRes, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+            Barrier(cl, mvRes, mvState, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
             Barrier(cl, g_mvPacked.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
             // D1-FIX: rebuild kSrvMvCur when the game rotates its MV (same-size identity change).
             //   Mirrors the A-form rebuild (the `static ID3D12Resource* lastMv` block) into B form.
@@ -9246,7 +9253,7 @@ extern "C" int ProxyExecute(void* ctx, void* cmdList, const void* params, float 
             SetPass(cl, g_psoMvPack.Get(), kSrvMvCur, kSrvMvCur, kSrvMvCur, kSrvMvCur, kSrvMvCur,
                     kSrvMvPacked, kSrvMvPacked, kNetW, kNetH);
             Barrier(cl, g_mvPacked.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
-            Barrier(cl, mvRes, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+            Barrier(cl, mvRes, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, mvState);
             
             // r28 块4：MV 本地暂存环 —— 把本帧 g_mvPacked 拷进 g_mvHist[N&7]，登记帧号给 XferMaybeKick
             // nowm 后帧标签与 C4 的 g_frame-1 一致；登记 N，不再沿用水印时代的 N+1。
@@ -9268,7 +9275,7 @@ extern "C" int ProxyExecute(void* ctx, void* cmdList, const void* params, float 
             }
 
             if (!g_bform4k) {
-                BformCopy(cl, color, g_mvPacked.Get(), depRes, jx, jy);
+                BformCopy(cl, color, g_mvPacked.Get(), depRes, jx, jy, colorState, D3D12_RESOURCE_STATE_COPY_SOURCE, depState);
             } else {
                 // ★ 4K 后置：B 形态下 A 不合成 ⇒ XeSS 可以提前到"敲铃之前"，顺序：
                 //   ⑥ XeSS(本帧 2K 原图 → 4K) → 转 8bit → 拷进槽位 →（之后照常敲铃）
@@ -9284,10 +9291,15 @@ extern "C" int ProxyExecute(void* ctx, void* cmdList, const void* params, float 
                 }
                 const int rc4 = real ? real(ctx, cl, b4) : errRc;
                 did4kUpscale = true;
+                // 外部超分（FSR3/FSR4/XeSS）可能切换了命令列表上的描述符堆；必须恢复 g_heap 再调 ImGui/SetPass
+                if (g_heap) {
+                    ID3D12DescriptorHeap* heaps4[] = { g_heap.Get() };
+                    cl->SetDescriptorHeaps(1, heaps4);
+                }
                 // ★ B 形态下菜单要能被看见：B 显示的就是这张 4K 底图，
                 //   所以把 ImGui 画进 pOutput 再转换 → 菜单自然跟着底图跨卡上屏。
                 //   （原来菜单只画在 A 的输出上，被 B 的覆盖层盖住 → B 形态看不见菜单）
-                ProxyImGuiDraw(cl, outp);
+                ProxyImGuiDraw(cl, outp, false, outState);
                     const int par8 = (int)(g_frame & 1);   // 双缓冲：本帧写哪一份
                     XferEnsure();   // ★ 必须先建好围栏：否则钩子不 Signal → 拷永远不触发（逻辑死锁）
                     // ★ 旧转换要追踪轮换的 pOutput；C4 转换自己绑定 T_src，且不登记 A 阶段抓帧。
@@ -9338,12 +9350,13 @@ extern "C" int ProxyExecute(void* ctx, void* cmdList, const void* params, float 
                 }
                 if (grab) { grab->Release(); grab = nullptr; }
                 if (!g_c4On && g_outp8Ready[par8] && g_psoFmt8) {   // 8bit 转换路径（C4 启用时让位给 present 队列的 C4Kick）
-                    Barrier(cl, outp, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+                    Barrier(cl, outp, outState, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
                     Barrier(cl, g_outp8[par8].Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
                     ID3D12DescriptorHeap* hh9[] = { g_heap.Get() };
                     cl->SetDescriptorHeaps(1, hh9);
                     SetPass(cl, g_psoFmt8.Get(), kSrvOutp, kSrvOutp, kSrvOutp, kSrvOutp, kSrvOutp,
                             (par8 ? kSrvOutp8b : kSrvOutp8), (par8 ? kSrvOutp8b : kSrvOutp8), g_outW, g_outH);
+                    Barrier(cl, outp, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, outState);
                     Barrier(cl, g_outp8[par8].Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
                     // ★ 4 坑 FIFO：每帧登记一个待拷；只要"又发生过提交"就逐个启动，任何一帧都不会被覆盖
                     for (int pi = 0; pi < 4; ++pi) {
@@ -9371,7 +9384,8 @@ extern "C" int ProxyExecute(void* ctx, void* cmdList, const void* params, float 
 
 
 
-                    BformCopy(cl, g_outp8[par8].Get(), g_mvPacked.Get(), depRes, 0.0f, 0.0f);  // 内部跳颜色
+                    BformCopy(cl, g_outp8[par8].Get(), g_mvPacked.Get(), depRes, 0.0f, 0.0f,
+                              D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE, depState);  // 内部跳颜色
                     // ★ 4K 底图内容抽检：读 1 行 8bit，均值接近 0 说明底图仍是黑的
                     if ((g_frame % 60) == 0) {
                         static ComPtr<ID3D12Resource> rbChk;
@@ -9404,7 +9418,7 @@ extern "C" int ProxyExecute(void* ctx, void* cmdList, const void* params, float 
             after_convert:;
             }
         } else {
-            if (!g_bform4k) BformCopy(cl, color, mvRes, depRes, jx, jy);
+            if (!g_bform4k) BformCopy(cl, color, mvRes, depRes, jx, jy, colorState, mvState, depState);
         }
     }
 
@@ -9416,6 +9430,10 @@ extern "C" int ProxyExecute(void* ctx, void* cmdList, const void* params, float 
     // worker still requests N at dispatch N+2; no changes to presentation or feed lag.
     if (a2Direct && !skipAPixels && aCaptureValid && cur.frame == N && cur.captured && cur.color && cur.mv &&
         g_netS && g_psoDown && g_heap && (A2In::initialized.load() || !g_bformOn)) {
+        {
+            ID3D12DescriptorHeap* hhA2[] = { g_heap.Get() };
+            cl->SetDescriptorHeaps(1, hhA2);
+        }
         g_curJitX = cur.jx; g_curJitY = cur.jy;
         const auto base = (UINT)(N % K);
         if (mqOn && !g_bformOn)
@@ -9455,6 +9473,10 @@ extern "C" int ProxyExecute(void* ctx, void* cmdList, const void* params, float 
     // ---------- ④ [GPU] legacy (non-A2): slot[N-1] → 1080p/readback ----------
     if (!a2Direct && !skipAPixels && N >= 1 && (!g_backendNgx ||
         (N > aChainFrom && g_slots[(N - 1) % K].captured && g_slots[(N - 1) % K].frame == N - 1))) {
+        if (g_heap) {
+            ID3D12DescriptorHeap* hh4[] = { g_heap.Get() };
+            cl->SetDescriptorHeaps(1, hh4);
+        }
         Slot& F = g_slots[(N - 1) % K];
         g_curJitX = F.jx; g_curJitY = F.jy;   // 去抖动必须用【这一帧被降采样的槽位】的 jitter
         // ★ 跑马灯：喂入之前先把【槽位底图】涂成相位黑条 ⇒ 喂入的图必然是跑马灯
@@ -9715,6 +9737,10 @@ extern "C" int ProxyExecute(void* ctx, void* cmdList, const void* params, float 
     const UINT srvPrevCol2 = g_useGpuResid ? (UINT)((slotBase + K - 1) % K) : kSrvRes;
     const UINT srvFedPair = (UINT)(kSrvFed + ((slotBase + K - fedOff) % K));
     const UINT srvMvPair  = (UINT)(kSrvMvBase + slotBase);
+    if (g_heap) {
+        ID3D12DescriptorHeap* hhR[] = { g_heap.Get() };
+        cl->SetDescriptorHeaps(1, hhR);
+    }
     SetPass(cl, g_psoResid.Get(), slotBase, srvPrevCol2, srvMvPair, srvFedPair, (UINT)kSrvAns, kSrvPre, kSrvSmooth, g_cw, g_ch);
      f9A.AnswerPath(g_useGpuResid && !g_bypass ? F9Id::GpuResidual : F9Id::CpuResidual);
 
@@ -9897,15 +9923,15 @@ extern "C" int ProxyExecute(void* ctx, void* cmdList, const void* params, float 
             //                 但 pColor 里只放【槽位原图】，残差 e 留到上采样后用 Add4K 叠到 4K 上。
             if (!g_resid4k) {
                 Barrier(cl, g_pre.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
-                Barrier(cl, color, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST);
+                Barrier(cl, color, colorState, D3D12_RESOURCE_STATE_COPY_DEST);
                 cl->CopyResource(color, g_pre.Get());
-                Barrier(cl, color, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON);
+                Barrier(cl, color, D3D12_RESOURCE_STATE_COPY_DEST, colorState);
                 Barrier(cl, g_pre.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
             } else {
                 Barrier(cl, P->color.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE);
-                Barrier(cl, color, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST);
+                Barrier(cl, color, colorState, D3D12_RESOURCE_STATE_COPY_DEST);
                 cl->CopyResource(color, P->color.Get());
-                Barrier(cl, color, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON);
+                Barrier(cl, color, D3D12_RESOURCE_STATE_COPY_DEST, colorState);
                 Barrier(cl, P->color.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
                 static int l4k = 0;
                 if ((l4k++ % 300) == 0) Log("B1: 帧%d pColor ← 槽位%d 原图（残差留到 4K 叠加）", N, presentFrame % K);
@@ -9934,6 +9960,10 @@ extern "C" int ProxyExecute(void* ctx, void* cmdList, const void* params, float 
             memcpy(buf + 48, &jx, 4); memcpy(buf + 52, &jy, 4);
         }
         rc = real ? real(ctx, cmdList, buf) : errRc;
+        if (g_heap) {
+            ID3D12DescriptorHeap* heaps6[] = { g_heap.Get() };
+            cl->SetDescriptorHeaps(1, heaps6);
+        }
     }
 
     // ---------- ⑥.2 【bform=9】把 XeSS 刚产出的 4K 画面拷进跨卡槽位（同帧，零额外延迟）----------
@@ -9962,13 +9992,13 @@ extern "C" int ProxyExecute(void* ctx, void* cmdList, const void* params, float 
             }
         }
         if (g_outp8Ready[0]) {
-            Barrier(cl, g_outpRes.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+            Barrier(cl, g_outpRes.Get(), outState, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
             Barrier(cl, g_outp8[0].Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
             ID3D12DescriptorHeap* hh9[] = { g_heap.Get() };
             cl->SetDescriptorHeaps(1, hh9);
             SetPass(cl, g_psoFmt8.Get(), kSrvOutp, kSrvOutp, kSrvOutp, kSrvOutp, kSrvOutp,
                     kSrvOutp8, kSrvOutp8, g_outW, g_outH);
-            Barrier(cl, g_outpRes.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
+            Barrier(cl, g_outpRes.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, outState);
             Barrier(cl, g_outp8[0].Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON);
             // ★ 注意：这里【不】拷进槽位！拷贝挪到下一帧开头（敲铃之前），见 BformCopy 调用处。
             //   原因：worker 在 A 敲铃时就会去解码槽位，如果拷贝发生在敲铃之后，
@@ -9981,7 +10011,7 @@ extern "C" int ProxyExecute(void* ctx, void* cmdList, const void* params, float 
         bindCurrentOutpSrv();   // B+C4 不更新 kSrvOutp；A Add4K 自己绑定本帧的输出
         Barrier(cl, g_pre.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
         Barrier(cl, P->color.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-        Barrier(cl, outp, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        Barrier(cl, outp, outState, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
         Barrier(cl, g_pre4k.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
         ID3D12DescriptorHeap* h4[] = { g_heap.Get() };
         cl->SetDescriptorHeaps(1, h4);
@@ -9991,7 +10021,7 @@ extern "C" int ProxyExecute(void* ctx, void* cmdList, const void* params, float 
         Barrier(cl, g_pre4k.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
         Barrier(cl, outp, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
         cl->CopyResource(outp, g_pre4k.Get());
-        Barrier(cl, outp, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON);
+        Barrier(cl, outp, D3D12_RESOURCE_STATE_COPY_DEST, outState);
         Barrier(cl, g_pre4k.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON);
         Barrier(cl, P->color.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
         Barrier(cl, g_pre.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
@@ -9999,8 +10029,8 @@ extern "C" int ProxyExecute(void* ctx, void* cmdList, const void* params, float 
         if ((l4k2++ % 300) == 0) Log("B1: 帧%d 已把残差叠到 4K（outp %ux%u）", N, g_outW, g_outH);
     }
 
-    if (!did4kUpscale) ProxyImGuiDraw(cl, outp, !g_bformOn && real && g_realDispatchFn && rc == okRc);   // 4K 模式下已在 ⑥ 之后提前画过（要跟着底图跨卡上屏）
-    MirrorTick(cl, outp);       // S1：镜像叠层（默认关；关时立即返回）
+    if (!did4kUpscale) ProxyImGuiDraw(cl, outp, !g_bformOn && real && g_realDispatchFn && rc == okRc, outState);   // 4K 模式下已在 ⑥ 之后提前画过（要跟着底图跨卡上屏）
+    MirrorTick(cl, outp, outState);       // S1：镜像叠层（默认关；关时立即返回）
     if ((g_frame % 300) == 0) BwPollFile();
     BwTick();                   // 带宽测试（默认关；关时立即返回）
 
