@@ -34,6 +34,13 @@ struct AdapterFrameDesc {
     AdapterFloat2 jitterOffset;
     bool reset = false;
     bool colorComposed = false;
+    uint32_t createFlags = 0;
+    bool flagsKnown = false;
+    bool isHdr = false;
+    bool autoExposure = false;
+    bool isPq = false;
+    float preExposure = 1.0f;
+    float exposureScale = 1.0f;
     int okCode = 0;
     int errCode = -1;
     uint32_t nativeSize = 0;

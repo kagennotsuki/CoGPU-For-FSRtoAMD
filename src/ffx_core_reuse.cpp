@@ -36,6 +36,7 @@
 #include <chrono>
 #include <atomic>
 #include <cmath>
+#include <algorithm>
 #include <share.h>
 #include <sys/stat.h>
 #include "b_ui_trace.h"
@@ -109,23 +110,23 @@ static volatile int   g_debugView = 0;            // 0=正常 1=代理 2=纯网�
 static volatile bool  g_bypass = false;           // 直出运行时输出（配合 debug_view 使用）
 
 static std::mutex g_logMtx;   // ★ Log 可能被多个线程（渲染/Present/worker）调用
-static volatile LONG g_diagLogOn = 0;   // 默认关闭所有写日志动作；1=开启诊断日志（菜单一键 / xess_proxy.log.txt / saved.ini）
+static volatile LONG g_diagLogOn = 1;   // 默认开启诊断日志；0=关闭写盘（菜单一键 / xess_proxy.log.txt / saved.ini）
 extern "C" int CoreDiagLogEnabled() { return g_diagLogOn ? 1 : 0; }
 
-static constexpr size_t kLogMaxBytes         = 20u * 1024u * 1024u;
-static constexpr size_t kLogCompactThreshold = 19u * 1024u * 1024u;
+static constexpr size_t kLogMaxBytes         = 30u * 1024u * 1024u;
+static constexpr size_t kLogCompactThreshold = 29u * 1024u * 1024u;
 static constexpr size_t kLogHeadKeep         = 64u * 1024u;
-static constexpr size_t kLogTailKeep         = 10u * 1024u * 1024u;
+static constexpr size_t kLogTailKeep         = 15u * 1024u * 1024u;
 static size_t           g_logBytes           = 0;
 static std::string      g_logPath;
-static unsigned char    g_logCopyBuf[256u * 1024u];   // 仅在 g_logMtx 内且超过 19MB 时使用，零堆分配
+static unsigned char    g_logCopyBuf[256u * 1024u];   // 仅在 g_logMtx 内且超过 29MB 时使用，零堆分配
 static FILETIME         g_logCfgFt           = {};
 static bool             g_logCfgHasFile      = false;
 
 static std::string ModuleDir();
 
-// ★ 体积上限控制：文件达到 ~19MB（严守 <= 20MB）时就地流式裁剪，
-//   保留启动头部 ~64KB + 最新 ~10MB（零堆分配、不Overlap、仅每次~9MB触发一次）
+// ★ 体积上限控制：文件达到 ~29MB（严守 <= 30MB）时就地流式裁剪，
+//   保留启动头部 ~64KB + 最新 ~15MB（零堆分配、不Overlap、仅每次~14MB触发一次）
 static void CompactLogLocked() {
     if (g_logPath.empty()) return;
     if (g_log) { fclose(g_log); g_log = nullptr; }
@@ -148,7 +149,7 @@ static void CompactLogLocked() {
             }
 
             static const char kTrimMarker[] =
-                "\r\n===== [xess_proxy.log] 旧日志已裁剪（保留启动前 64KB + 最新约 10MB，上限 20MB）=====\r\n";
+                "\r\n===== [xess_proxy.log] 旧日志已裁剪（保留启动前 64KB + 最新约 15MB，上限 30MB）=====\r\n";
             const LONGLONG markerLen = (LONGLONG)(sizeof(kTrimMarker) - 1);
 
             LONGLONG tailStart = fsz.QuadPart - (LONGLONG)kLogTailKeep;
@@ -351,7 +352,7 @@ static void SetDiagLogEnabled(bool on, bool persistFlagFile, const char* reason,
             OpenLogLocked(!freshTruncate);
         }
         if (!prev || freshTruncate) {
-            Log("=== 诊断日志已开启（%s · 体积上限 20MB）===", reason ? reason : "manual");
+            Log("=== 诊断日志已开启（%s · 体积上限 30MB）===", reason ? reason : "manual");
         }
     } else {
         if (prev) Log("=== 诊断日志已关闭（%s）===", reason ? reason : "manual");
@@ -371,8 +372,8 @@ static void DiagLogInit() {
     const bool hasIni = ReadSavedIniDiagFlag(iniOn, iniFt);
     if (hasCfg) { g_logCfgFt = cfgFt; g_logCfgHasFile = true; }
 
-    bool startOn = false;
-    const char* src = "默认关闭";
+    bool startOn = true;
+    const char* src = "默认开启";
     if (hasCfg && hasIni) {
         if (CompareFileTime(&iniFt, &cfgFt) > 0) { startOn = iniOn; src = "xess_proxy.saved.ini"; }
         else { startOn = cfgOn; src = "xess_proxy.log.txt"; }
@@ -1437,6 +1438,8 @@ static void BformDiagEnqueue(Worker& W, ID3D12Resource* ans, int slot = 0, bool 
 static void BformDiagReadback(Worker& W);   // 回读 + 打一行数字
 static ComPtr<ID3D12Resource> g_ppAns[2];   // WorkerMain 里要用，提前声明
 static bool BformBUpscale(ID3D12GraphicsCommandList* cl, int slot = 0);
+static void BformResetWorkerResources();
+static int  BformResolveInputHdrMode();
 static HWND g_gameHwnd = nullptr;
 // ★ 取句柄不能依赖菜单：B 形态出画（DComp 贴到游戏窗口）必须要 HWND，
 //   而以前唯一的取句柄入口在 Del 菜单里 → 不开一次菜单就永远 g_gameHwnd == nullptr
@@ -1658,20 +1661,66 @@ struct UiGateAutoLeave {
 //   bform=8 = 阶段 6 + 一个 TAA pass（jitter 由共享 buffer 头部传；本版先不做 jitter 补偿）
 //   出画源从 g_bUp4k 换成 TAA 输出；bform=6 保持原样，方便 A/B 对照
 static bool g_taaOn = false;
-// ---- 4K 后置：10bit→8bit 转换（pOutput 是 R10G10B10A2，我们整条链是 8bit）----
+// ---- 4K 后置：跨卡格式转换（SDR=B8G8R8A8_UNORM，HDR=R10G10B10A2_UNORM PQ BT.2020）----
 static const char* kBformFmt8 = R"(
+cbuffer P : register(b0) { float4 gC[5]; };
 Texture2D<float4>   gS : register(t0);
 RWTexture2D<float4> gD : register(u0);
+static const float kFmtPqM1 = 2610.0 / 16384.0;
+static const float kFmtPqM2 = 2523.0 / 32.0;
+static const float kFmtPqC1 = 3424.0 / 4096.0;
+static const float kFmtPqC2 = 2413.0 / 128.0;
+static const float kFmtPqC3 = 2392.0 / 128.0;
+float3 FmtBt709To2020(float3 c) {
+    return float3(
+        dot(c, float3(0.6274040, 0.3292830, 0.0433130)),
+        dot(c, float3(0.0690970, 0.9195400, 0.0113620)),
+        dot(c, float3(0.0163914, 0.0880133, 0.8955950))
+    );
+}
+float3 FmtCleanRgb(float3 c) {
+    if ((asuint(c.r) & 0x7F800000u) == 0x7F800000u) c.r = 0.0;
+    if ((asuint(c.g) & 0x7F800000u) == 0x7F800000u) c.g = 0.0;
+    if ((asuint(c.b) & 0x7F800000u) == 0x7F800000u) c.b = 0.0;
+    return c;
+}
+float3 FmtLinToPQ(float3 linNorm) {
+    float3 x = max(FmtCleanRgb(linNorm), 0.0);
+    float3 lm = pow(max(x, 1e-7), kFmtPqM1);
+    float3 pq = pow(max((kFmtPqC1 + kFmtPqC2 * lm) / max(1.0 + kFmtPqC3 * lm, 1e-6), 1e-7), kFmtPqM2);
+    return lerp(float3(0.0, 0.0, 0.0), saturate(pq), step(1e-7, x));
+}
 [numthreads(8,8,1)]
 void main(uint3 id : SV_DispatchThreadID) {
     uint w, h; gD.GetDimensions(w, h);
     if (id.x >= w || id.y >= h) return;
-    gD[id.xy] = float4(gS.Load(int3(id.xy, 0)).rgb, 1.0);
+    float3 c = FmtCleanRgb(gS.Load(int3(id.xy, 0)).rgb);
+    int hdrMode = (int)(gC[0].w + 0.5);
+    if (gC[4].w < 0.5 && hdrMode == 1) {
+        float3 sc = clamp(c, 0.0, 125.0);
+        c = FmtLinToPQ(max(FmtBt709To2020(sc) * (80.0 / 10000.0), 0.0));
+    } else if (gC[4].w < 0.5 && hdrMode == 2) {
+        c = saturate(c);
+    }
+    gD[id.xy] = float4(c, 1.0);
 }
 )";
-static ComPtr<ID3D12Resource> g_outp8[3];   // 4K / B8G8R8A8 转换结果（三缓冲：c4outp3 与 C4 三套 allocator 对齐）
+static ComPtr<ID3D12Resource> g_outp8[3];   // 4K 转换结果（SDR=B8G8R8A8, HDR=R10G10B10A2_UNORM；三缓冲与 C4 三套 allocator 对齐）
 static ComPtr<ID3D12PipelineState> g_psoFmt8;
 static bool g_outp8Ready[3] = { false, false, false };
+static std::atomic<UINT> g_scBbFmt{0};
+static std::atomic<int>  g_scColorSpace{-1};
+static std::atomic<UINT> g_scOutputHdr{0};
+static volatile int       g_bHdrMode = 0;         // 0=SDR, 1=scRGB FP16, 2=PQ HDR10
+static std::atomic<int>  g_bOutHdrMode{0};        // DComp 输出模式: 0=SDR, 1=scRGB FP16, 2=PQ HDR10
+static DXGI_FORMAT       g_bpFmt = DXGI_FORMAT_UNKNOWN;
+static std::atomic<UINT> g_bHdrRebuildGen{0};     // B 形态 HDR 模式变更重连世代
+static bool               g_bCompFailNgx = false;
+extern "C" __declspec(dllexport) void AmdNrSetSwapChainHdrInfo(unsigned int bbFmt, int colorSpace, unsigned int outputHdr) {
+    if (bbFmt) g_scBbFmt.store((UINT)bbFmt, std::memory_order_relaxed);
+    if (colorSpace >= 0) g_scColorSpace.store(colorSpace, std::memory_order_relaxed);
+    g_scOutputHdr.store((UINT)(outputHdr ? 1u : 0u), std::memory_order_relaxed);
+}
 static ComPtr<ID3D12CommandQueue>        g_xqQ;
 static ComPtr<ID3D12CommandAllocator>    g_xqAl[3];   // 3 组轮转（单组会在上一份拷贝没跑完时 Reset 失败 → 半帧不更新 → 画面交替）
 static ComPtr<ID3D12GraphicsCommandList> g_xqCl[3];
@@ -2224,6 +2273,7 @@ static void WorkerMain() {
     int lastA3Gen = -1, lastA3Dispatch = -1;
     uint64_t lastA3Epoch = 0;
     bool a3PendingCheck = false;
+    UINT lastHdrRebuildGen = g_bHdrRebuildGen.load(std::memory_order_acquire);
     while (true) {
         std::vector<uint8_t> local;
         int idx = -1, frameId = -1, feedAGen = -1, f9Dispatch = -1;
@@ -2338,9 +2388,17 @@ static void WorkerMain() {
             bool decOk = true;
             // r28 块2：decSlot/r28LeaseOk/r28WaitFv 提升到外层（BtWorkerExec("eval") 前要用）
             int decSlot = -1; UINT64 r28WaitFv = 0; bool r28LeaseOk = false;
+            {
+                const UINT curHdrGen = g_bHdrRebuildGen.load(std::memory_order_acquire);
+                if (curHdrGen != lastHdrRebuildGen) {
+                    lastHdrRebuildGen = curHdrGen;
+                    BformResetWorkerResources();
+                }
+            }
+            const bool bUseFp16 = (g_bHdrMode != 0);
             R28BSnapshot r28s{ -1, -1, 0, 0 };
             g_tlDecodeWaitEnqueued = 0;
-            if (!a3Wake && g_bformOn && g_bformReady && g_upBufW && W.color && g_bformStage >= 3 && UiGateAllowsNr() &&
+            if (!a3Wake && g_bformOn && g_bformReady && g_upBufW && (bUseFp16 ? W.colorFp16 : W.color) && g_bformStage >= 3 && UiGateAllowsNr() &&
                 BformBEnsureDS(W.dev.Get())) {
                 bAttempted = true;
                 R28BPollAck();   // r28 块2：每轮开头处理 RETIRING→FREE 和 MAX→NrHardFail
@@ -2419,11 +2477,12 @@ static void WorkerMain() {
                     if (mf > 0 && decOk) BformBMarkSlot(W.cl.Get(), mf);
                 }
                 if (decOk && g_bTexC) {
-                    // W.color 上一帧可能被核心留在 SRV 态（sampled in place），先摆回 COMMON；
-                    // 降采样内部对它不做状态转换（沿用 B 形态原约定），所以必须由我们摆好。
-                    Barrier(W.cl.Get(), W.color.Get(), W.ngxColState, D3D12_RESOURCE_STATE_COMMON);
-                    if (BformBDownsample(W.cl.Get(), W.color.Get())) {
-                        W.ngxColState = D3D12_RESOURCE_STATE_COMMON;
+                    // W.color / W.colorFp16 上一帧可能被核心留在 SRV 态（sampled in place），先摆回 COMMON
+                    ID3D12Resource* bDsDst = bUseFp16 ? W.colorFp16.Get() : W.color.Get();
+                    D3D12_RESOURCE_STATES& bDsState = bUseFp16 ? W.ngxColFp16State : W.ngxColState;
+                    Barrier(W.cl.Get(), bDsDst, bDsState, D3D12_RESOURCE_STATE_COMMON);
+                    if (BformBDownsample(W.cl.Get(), bDsDst)) {
+                        bDsState = D3D12_RESOURCE_STATE_COMMON;
                         bPrep = true;
                     }
                 }
@@ -2499,7 +2558,7 @@ static void WorkerMain() {
                 a2Lease.Acquire({frameId, feedAGen, feedAResetEpoch}, W.q.Get(), W.color.Get(), W.vel.Get()) : nullptr;
             const bool useAInput = wantsA && (!A2In::requested || a2Source != nullptr);
             F9Id::Path f9ColorPath = F9Id::NoInputCopy, f9MvPath = F9Id::NoInputCopy;
-            const bool useFp16Ngx = (a2Source != nullptr && a2Token.slot && a2Token.slot->a3);
+            const bool useFp16Ngx = (bPrep && bUseFp16) || (a2Source != nullptr && a2Token.slot && a2Token.slot->a3);
             if (a2Source) {
                 A2In::RecordWorkerCopies(W.cl.Get(), a2Source,
                                          useFp16Ngx ? W.colorFp16.Get() : W.color.Get(), W.vel.Get(),
@@ -2770,18 +2829,17 @@ static void WorkerMain() {
             //   ⇒ B 卡永远只"解码 + 喂网"，从不出画。这里补齐：合成 →（4K 时直通）→ 覆盖层出画。
             //   答案状态：核心把 po 留在 UNORDERED_ACCESS（下次评估还要写），而 BformBCompose 从
             //   COMMON 起跳 ⇒ 进之前摆回 COMMON，出之后恢复 UAV。
-            static bool bCompFailNgx = false;
             static int lastCompSlot = 1;
             const bool composeAllowed = po && decOk && g_bformOn && g_bformReady && g_bformStage >= 4 &&
-                !bCompFailNgx && UiGateAllowsNr() && modeEpoch == InterlockedCompareExchange(&g_r28Epoch, 0, 0) &&
+                !g_bCompFailNgx && UiGateAllowsNr() && modeEpoch == InterlockedCompareExchange(&g_r28Epoch, 0, 0) &&
                 uiEpoch == BformUiEpoch();
             if (composeAllowed) {
+                if (g_bformStage >= 6 && !g_bpReady && !g_bpFailed) BformPresentInit();
                 if (!BformBEnsureComp(W.dev.Get()) ||
                     (g_bformStage >= 5 && !BformBEnsureUp(W.dev.Get()))) {
-                    bCompFailNgx = true;
+                    g_bCompFailNgx = true;
                     Log("BFORM-B(NGX): 合成/上采样资源就绪失败 → 本会话不再尝试 B 出画");
                 } else {
-                    if (g_bformStage >= 6 && !g_bpReady && !g_bpFailed) BformPresentInit();
                     const int slot = lastCompSlot ^ 1;
                     const bool direct4k = g_bform4k;
                     const bool upscale = g_bformStage >= 5 && !direct4k && g_bUpReady;
@@ -3253,7 +3311,7 @@ static Slot g_slots[K];
 
 static ComPtr<ID3D12Device> g_dev;
 static ComPtr<ID3D12RootSignature> g_rs;
-static ComPtr<ID3D12PipelineState> g_psoDown, g_psoResid, g_psoAdd4K, g_psoMvPack, g_psoMark, g_psoTri;
+static ComPtr<ID3D12PipelineState> g_psoDown, g_psoResid, g_psoAdd4K, g_psoMvPack, g_psoMark, g_psoTri, g_psoScale;
 static ComPtr<ID3D12DescriptorHeap> g_heap;
 static UINT g_inc = 0;
 static D3D12_CPU_DESCRIPTOR_HANDLE g_cpuResSmooth{};
@@ -3301,6 +3359,27 @@ static int g_dumpPhase = 0;                       // 0=未开始 1=已记录拷�
 static bool g_mirOn = false;
 static int  g_mirState = 0;     // 0=未建 3=已关(可再开) 1=就绪 2=失败(不再重试)
 
+// ---------------- HDR 支持参数（A 形态优先；B 形态预留） ----------------
+// hdr_override: 0=Auto(由 IsHDR / Format / PQ 自动判定), 1=ForceSDR, 2=ForceLinearHDR, 3=ForcePQHDR10
+// hdr_curve:    0=Neutwo(推荐), 1=SoftKnee(保留 HybridEnc)
+// hdr_exp_src:  0=Auto(融合 game exposure 与 8x8 扫描), 1=ScanOnly(仅 8x8 扫描)
+static int   g_hdrOverride    = 0;
+static int   g_hdrCurve       = 0;
+static int   g_hdrExpSource   = 0;
+static float g_hdrWhiteScale  = 1.0f;    // 0.25 ~ 4.0（白点缩放倍率）
+static float g_hdrPqWhiteNits = 203.0f;  // 80 ~ 1000（PQ 参考白亮度，BT.2408 默认 203）
+static float g_hdrChromaClamp = 1.0f;    // 0=关闭高光保护, 1=开启（高光收敛与峰谷保护）
+
+// A3 HDR 实时观测遥测（菜单只读显示）
+static std::atomic<UINT>  g_a3LastHdrMode{0};
+static std::atomic<UINT>  g_a3LastColorFmt{0};
+static std::atomic<bool>  g_a3LastHasExpTex{false};
+static std::atomic<bool>  g_a3LastAutoExp{false};
+static std::atomic<bool>  g_a3LastIsHdrFlag{false};
+static std::atomic<float> g_a3LastPreExp{1.0f};
+static std::atomic<float> g_a3LastExpScale{1.0f};
+static std::atomic<float> g_a3LastDivisor{1.0f};
+
 // ---------------- 参数快照 / 用户存档（菜单：保存 / 撤销 / 恢复 / 出厂） ----------------
 // 三层语义，互不污染：
 //   出厂默认 = 代码里的常量（FactoryParams）—— 任何按钮都不会改它
@@ -3323,6 +3402,9 @@ struct Params {
     float ppBias, ppContrast, ppSat;
     int   nrScaleMode;
     bool  diagLogOn;         // 诊断日志开关（默认关闭；与 xess_proxy.log.txt / 菜单同步）
+    // HDR
+    int   hdrOverride, hdrCurve, hdrExpSource;
+    float hdrWhiteScale, hdrPqWhiteNits, hdrChromaClamp;
 };
 static Params g_sessionStart{};
 static bool   g_sessionStartValid = false;
@@ -3344,6 +3426,8 @@ static Params CaptureParams() {
     p.ppCurve = g_ppCurve; p.ppContrast = g_ppContrast; p.ppSat = g_ppSat;
     p.nrScaleMode = g_nrScaleMode;
     p.diagLogOn = (g_diagLogOn != 0);
+    p.hdrOverride = g_hdrOverride; p.hdrCurve = g_hdrCurve; p.hdrExpSource = g_hdrExpSource;
+    p.hdrWhiteScale = g_hdrWhiteScale; p.hdrPqWhiteNits = g_hdrPqWhiteNits; p.hdrChromaClamp = g_hdrChromaClamp;
     return p;
 }
 static void ApplyParams(const Params& p) {
@@ -3369,6 +3453,12 @@ static void ApplyParams(const Params& p) {
     if ((g_diagLogOn != 0) != p.diagLogOn) {
         SetDiagLogEnabled(p.diagLogOn, true, "参数应用");
     }
+    g_hdrOverride    = (p.hdrOverride >= 0 && p.hdrOverride <= 3) ? p.hdrOverride : 0;
+    g_hdrCurve       = (p.hdrCurve >= 0 && p.hdrCurve <= 1) ? p.hdrCurve : 0;
+    g_hdrExpSource   = (p.hdrExpSource >= 0 && p.hdrExpSource <= 1) ? p.hdrExpSource : 0;
+    g_hdrWhiteScale  = std::clamp(p.hdrWhiteScale, 0.1f, 8.0f);
+    g_hdrPqWhiteNits = std::clamp(p.hdrPqWhiteNits, 80.0f, 1000.0f);
+    g_hdrChromaClamp = std::clamp(p.hdrChromaClamp, 0.0f, 1.0f);
     g_ctrlDirty = true;
 }
 static Params FactoryParams() {
@@ -3385,7 +3475,9 @@ static Params FactoryParams() {
     p.ppOn = true; p.ppExpMode = 1; p.ppBias = 0.0f;
     p.ppCurve = 3; p.ppContrast = 1.0f; p.ppSat = 1.0f;
     p.nrScaleMode = 0;
-    p.diagLogOn = false;
+    p.diagLogOn = true;
+    p.hdrOverride = 0; p.hdrCurve = 0; p.hdrExpSource = 0;
+    p.hdrWhiteScale = 1.0f; p.hdrPqWhiteNits = 203.0f; p.hdrChromaClamp = 1.0f;
     return p;
 }
 static bool SaveParamsToFile(const Params& p) {
@@ -3407,6 +3499,8 @@ static bool SaveParamsToFile(const Params& p) {
             (int)p.ppOn, p.ppExpMode, p.ppBias, p.ppCurve, p.ppContrast, p.ppSat);
     fprintf(f, "nr_scale_mode=%d\n", p.nrScaleMode);
     fprintf(f, "diag_log=%d\n", (int)p.diagLogOn);
+    fprintf(f, "hdr_override=%d\nhdr_curve=%d\nhdr_exp_source=%d\nhdr_white_scale=%.6f\nhdr_pq_white_nits=%.2f\nhdr_chroma_clamp=%.3f\n",
+            p.hdrOverride, p.hdrCurve, p.hdrExpSource, p.hdrWhiteScale, p.hdrPqWhiteNits, p.hdrChromaClamp);
     fclose(f);
     WriteDiagFlagFile(p.diagLogOn);
     Log("菜单: 已保存设置 → %s", path.c_str());
@@ -3466,6 +3560,12 @@ static bool LoadParamsFromFile(Params& p) {   // 只覆盖文件里出现的键
         else if (!strcmp(k, "pp_saturation")) p.ppSat = fv;
         else if (!strcmp(k, "nr_scale_mode")) p.nrScaleMode = (iv >= 0 && iv <= 7) ? iv : 0;
         else if (!strcmp(k, "diag_log")) { if (allowIniDiagLog) p.diagLogOn = (iv != 0); }
+        else if (!strcmp(k, "hdr_override")) p.hdrOverride = (iv >= 0 && iv <= 3) ? iv : 0;
+        else if (!strcmp(k, "hdr_curve")) p.hdrCurve = (iv >= 0 && iv <= 1) ? iv : 0;
+        else if (!strcmp(k, "hdr_exp_source")) p.hdrExpSource = (iv >= 0 && iv <= 1) ? iv : 0;
+        else if (!strcmp(k, "hdr_white_scale")) p.hdrWhiteScale = std::clamp(fv, 0.1f, 8.0f);
+        else if (!strcmp(k, "hdr_pq_white_nits")) p.hdrPqWhiteNits = std::clamp(fv, 80.0f, 1000.0f);
+        else if (!strcmp(k, "hdr_chroma_clamp")) p.hdrChromaClamp = std::clamp(fv, 0.0f, 1.0f);
         else continue;
         ++n;
     }
@@ -3638,10 +3738,16 @@ float3 SrgbEnc(float3 v) {
     float3 b = 1.055 * pow(max(v, 1e-8), 1.0 / 2.4) - 0.055;
     return lerp(a, b, step(0.0031308, v));
 }
+float3 CleanRgb(float3 c) {
+    if ((asuint(c.r) & 0x7F800000u) == 0x7F800000u) c.r = 0.0;
+    if ((asuint(c.g) & 0x7F800000u) == 0x7F800000u) c.g = 0.0;
+    if ((asuint(c.b) & 0x7F800000u) == 0x7F800000u) c.b = 0.0;
+    return c;
+}
 float3 SrgbDec(float3 v) {
-    v = saturate(v);
+    v = saturate(CleanRgb(v));
     float3 a = v / 12.92;
-    float3 b = pow((v + 0.055) / 1.055, 2.4);
+    float3 b = pow(max((v + 0.055) / 1.055, 1e-6), 2.4);
     return lerp(a, b, step(0.04045, v));
 }
 float3 HybridEnc(float3 v) {
@@ -3651,6 +3757,112 @@ float3 HybridEnc(float3 v) {
     float e = (m - 0.75) * 4.0;
     float h = 0.75 + 0.25 * (e * rsqrt(e * e + 1.0));
     return v * (h / max(m, 1e-6));
+}
+float3 NeutwoEnc(float3 v) {
+    v = clamp(v, 0.0, 1000.0);
+    float m = max(v.r, max(v.g, v.b));
+    if (m <= 1e-6) return float3(0.0, 0.0, 0.0);
+    float h = m * rsqrt(m * m + 1.0);
+    return v * (h / m);
+}
+float3 HdrCurveEnc(float3 v, float curveId) {
+    return (curveId > 0.5) ? HybridEnc(v) : NeutwoEnc(v);
+}
+
+static const float kPqM1 = 2610.0 / 16384.0;
+static const float kPqM2 = 2523.0 / 32.0;
+static const float kPqC1 = 3424.0 / 4096.0;
+static const float kPqC2 = 2413.0 / 128.0;
+static const float kPqC3 = 2392.0 / 128.0;
+
+float3 PQToLinear(float3 pq) {
+    float3 s = saturate(CleanRgb(pq));
+    float3 p = pow(max(s, 1e-7), 1.0 / kPqM2);
+    float3 num = max(p - kPqC1, 0.0);
+    float3 den = max(kPqC2 - kPqC3 * p, 1e-6);
+    float3 res = pow(max(num / den, 1e-7), 1.0 / kPqM1);
+    return lerp(float3(0.0, 0.0, 0.0), res, step(1e-6, num) * step(1e-7, s));
+}
+float3 LinearToPQ(float3 linNorm) {
+    float3 x = max(CleanRgb(linNorm), 0.0);
+    float3 lm = pow(max(x, 1e-7), kPqM1);
+    float3 pq = pow(max((kPqC1 + kPqC2 * lm) / max(1.0 + kPqC3 * lm, 1e-6), 1e-7), kPqM2);
+    return lerp(float3(0.0, 0.0, 0.0), saturate(pq), step(1e-7, x));
+}
+float3 Bt2020ToBt709(float3 c) {
+    return float3(
+        dot(c, float3( 1.6604910, -0.5876411, -0.0728499)),
+        dot(c, float3(-0.1245505,  1.1328999, -0.0083494)),
+        dot(c, float3(-0.0181508, -0.1005789,  1.1187297))
+    );
+}
+float3 Bt709To2020(float3 c) {
+    return float3(
+        dot(c, float3(0.6274040, 0.3292830, 0.0433130)),
+        dot(c, float3(0.0690970, 0.9195400, 0.0113620)),
+        dot(c, float3(0.0163914, 0.0880133, 0.8955950))
+    );
+}
+
+groupshared float gsLum[64];
+
+// A3 HDR 曝光/白点比例估计（8x8=64 采样网格 + ping-pong attack/release 平滑）
+//   t0=Base, t1=Exposure(可哑纹理), t2=CommitSrv(上一帧状态), u0=ScaleUav, u1=CommitUav
+[numthreads(8,8,1)]
+void ScaleCS(uint3 tid : SV_DispatchThreadID, uint gi : SV_GroupIndex)
+{
+    int hdrMode = (int)(gGain + 0.5);
+    float whiteScale = max(gMvScale, 0.05);
+    if (hdrMode == 2) {
+        if (gi == 0) {
+            float div = clamp(1.0 / whiteScale, 0.05, 16.0);
+            gSt[uint2(0,0)]  = float4(div, div, 1.0, 1.0);
+            gDst[uint2(0,0)] = float4(div, 1.0, 1.0, 1.0);
+        }
+        return;
+    }
+    float2 uv = (float2(tid.xy) + 0.5) / 8.0;
+    float3 c = gSrc.SampleLevel(gSmp, uv, 0).rgb;
+    float lum = dot(max(c, 0.0), float3(0.2126, 0.7152, 0.0722));
+    if ((asuint(lum) & 0x7F800000u) == 0x7F800000u || lum < 0.0) lum = -1.0;
+    else lum = clamp(lum, 1e-4, 10000.0);
+    gsLum[gi] = lum;
+    GroupMemoryBarrierWithGroupSync();
+    if (gi != 0) return;
+
+    float sumLog = 0.0;
+    float top4[4] = { 0.0, 0.0, 0.0, 0.0 };
+    int cnt = 0;
+    [loop] for (int k = 0; k < 64; ++k) {
+        float v = gsLum[k];
+        if (v < 0.0) continue;
+        sumLog += log2(v);
+        ++cnt;
+        if (v > top4[3]) {
+            top4[3] = v;
+            if (top4[3] > top4[2]) { float t = top4[2]; top4[2] = top4[3]; top4[3] = t; }
+            if (top4[2] > top4[1]) { float t = top4[1]; top4[1] = top4[2]; top4[2] = t; }
+            if (top4[1] > top4[0]) { float t = top4[0]; top4[0] = top4[1]; top4[1] = t; }
+        }
+    }
+    float geomMean = (cnt > 0) ? exp2(sumLog / float(cnt)) : 0.18;
+    float p94 = (cnt >= 4) ? top4[3] : geomMean;
+    float scanDiv = clamp(max(geomMean / 0.18, p94 / 2.0), 0.25, 64.0);
+    float targetDiv = scanDiv;
+    if (gSat > 0.5 && gMvIdx < 0.5) {
+        float expTex = gRes.Load(int3(0, 0, 0)).r;
+        if ((asuint(expTex) & 0x7F800000u) != 0x7F800000u && expTex > 1e-4 && expTex < 256.0 && abs(expTex - 1.0) > 1e-4) {
+            float gameDiv = clamp(1.0 / expTex, scanDiv * 0.5, scanDiv * 2.0);
+            targetDiv = clamp(lerp(scanDiv, gameDiv, 0.5), 0.125, 64.0);
+        }
+    }
+    float4 prev = gMV.Load(int3(0, 0, 0));
+    float prevDiv = ((asuint(prev.r) & 0x7F800000u) != 0x7F800000u && prev.r >= 0.05 && prev.r <= 128.0) ? prev.r : targetDiv;
+    float alpha = (gMvConf > 0.5) ? 1.0 : ((targetDiv > prevDiv) ? 0.22 : 0.06);
+    float smoothed = (abs(targetDiv - prevDiv) < prevDiv * 0.015 && gMvConf < 0.5) ? prevDiv : lerp(prevDiv, targetDiv, alpha);
+    float finalDiv = clamp(smoothed / whiteScale, 0.05, 128.0);
+    gSt[uint2(0,0)]  = float4(smoothed, targetDiv, scanDiv, 1.0);
+    gDst[uint2(0,0)] = float4(finalDiv, geomMean, p94, 1.0);
 }
 
 // 小图 → 1080p（喂给网络）
@@ -3665,11 +3877,6 @@ void DownCS(uint3 id : SV_DispatchThreadID)
         uint sw, sh; gSrc.GetDimensions(sw, sh);
         uv += float2(gJitX, gJitY) / float2(max(sw,1), max(sh,1)) * gDejitter;
     }
-    // ★对齐修正（2077 适配）：原来写死"源比目标大约 1.16 倍"的 2x2 平均。
-    //   比例随游戏/分辨率变化（2077 首测是 1280x720 → 1920x1080 = 放大 1.5 倍），
-    //   放大时做"2x2 平均"等于只采一个点还引入偏移 → 静态闪烁。改为按真实比例分流：
-    //     源 ≥ 目标（缩小）→ 4 抽头盒式平均（偏移按真实比例）
-    //     源 <  目标（放大）→ 单次双线性（唯一正确的做法）
     uint sw, sh; gSrc.GetDimensions(sw, sh);
     float2 srcTexel = 1.0 / float2(max(sw, 1), max(sh, 1));
     float ratio = float(sw) / float(max(w, 1));      // <1 放大；>1 缩小
@@ -3685,15 +3892,28 @@ void DownCS(uint3 id : SV_DispatchThreadID)
         c = gSrc.SampleLevel(gSmp, uv, 0);           // 放大或 1:1：双线性一次到位
     }
     if (gPadJ > 0.5) {
-        // A3 FP16 路径：可逆混合曲线（<=0.75 恒等，>0.75 无损压进 [0.75,1)）+ sRGB 编码
-        // 严格保证送进 Swin 网络的数据落在 [0,1] 显示域内，消除窗口浮点溢出闪烁与色偏
-        gDst[id.xy] = float4(SrgbEnc(HybridEnc(c.rgb)), 1.0);
+        int hdrMode = (int)(gGain + 0.5);
+        float3 cClean = CleanRgb(c.rgb);
+        float3 lin = clamp(max(cClean, 0.0), 0.0, 65504.0);
+        if (hdrMode == 1) {
+            float div = max(gRes.Load(int3(0, 0, 0)).r, 1e-4);
+            lin = lin / div;
+        } else if (hdrMode == 2) {
+            float div = max(gRes.Load(int3(0, 0, 0)).r, 1e-4);
+            float pqWhite = max(gTemporal, 80.0);
+            lin = max(Bt2020ToBt709(PQToLinear(cClean) * (10000.0 / pqWhite)), 0.0) / div;
+        }
+        float3 enc = (hdrMode == 0) ? HybridEnc(lin) : HdrCurveEnc(lin, gSat);
+        gDst[id.xy] = float4(SrgbEnc(enc), 1.0);
     } else {
         gDst[id.xy] = float4(PpApply(c.rgb, gEdge, gVarGain, gMvConf, gMvIdx, gGateK), 1.0);
     }
 }
 
 // 槽位原图 + 残差 → 合成后的 pColor
+)";
+
+static const char* kHLSLResid = R"(
 [numthreads(8,8,1)]
 void ResidCS(uint3 id : SV_DispatchThreadID)
 {
@@ -3730,20 +3950,55 @@ void ResidCS(uint3 id : SV_DispatchThreadID)
         float4 f = gFed.Load(int3(c0, 0))  * w00 + gFed.Load(int3(c10, 0)) * w10
                  + gFed.Load(int3(c01, 0)) * w01 + gFed.Load(int3(c11, 0)) * w11;
         if (gPadJ > 0.5) {
-            // 不做渐近线 HybridDec 反解（避免 m>2 时导数爆炸把高亮天空与亮边微抖动放大成刺眼白噪点）：
-            //   · <=0.75 主体区：HybridEnc 为 1:1 恒等，dHyb 即精确线性光残差
-            //   · >0.75 高亮区：按压缩域相对比例 dProp = c * (dHyb / fHyb) 回填，并在过曝区平滑收敛回原图
-            float3 aHyb = SrgbDec(a.rgb);
-            float3 fHyb = SrgbDec(f.rgb);
-            float3 dHyb = aHyb - fHyb;
-            float3 cHyb = HybridEnc(c.rgb);
-            float mF = max(fHyb.r, max(fHyb.g, fHyb.b));
-            float mC = max(cHyb.r, max(cHyb.g, cHyb.b));
-            float mRef = max(mF, mC);
-            float3 dProp = max(c.rgb, 0.0) * clamp(dHyb / max(fHyb, 0.125), -0.35, 0.35);
-            float wProp = smoothstep(0.65, 0.85, mRef);
-            float fadeHi = 1.0 - smoothstep(0.88, 0.99, mRef);
-            e = lerp(dHyb, dProp, wProp) * fadeHi;
+            int hdrMode = (int)(gGain + 0.5);
+            if (hdrMode == 0) {
+                float3 aHyb = SrgbDec(a.rgb);
+                float3 fHyb = SrgbDec(f.rgb);
+                float3 dHyb = aHyb - fHyb;
+                float3 cHyb = HybridEnc(c.rgb);
+                float mF = max(fHyb.r, max(fHyb.g, fHyb.b));
+                float mC = max(cHyb.r, max(cHyb.g, cHyb.b));
+                float mRef = max(mF, mC);
+                float3 dProp = max(c.rgb, 0.0) * clamp(dHyb / max(fHyb, 0.125), -0.35, 0.35);
+                float wProp = smoothstep(0.65, 0.85, mRef);
+                float fadeHi = 1.0 - smoothstep(0.88, 0.99, mRef);
+                e = lerp(dHyb, dProp, wProp) * fadeHi;
+            } else {
+                float div = max(gMV.Load(int3(0, 0, 0)).r, 1e-4);
+                float pqWhite = max(gTemporal, 80.0);
+                float3 cClean = CleanRgb(c.rgb);
+                float3 cLin = (hdrMode == 1)
+                    ? (clamp(max(cClean, 0.0), 0.0, 65504.0) / div)
+                    : (max(Bt2020ToBt709(PQToLinear(cClean) * (10000.0 / pqWhite)), 0.0) / div);
+                float3 aHyb = SrgbDec(a.rgb);
+                float3 fHyb = SrgbDec(f.rgb);
+                float3 dHyb = aHyb - fHyb;
+                float3 cEnc = HdrCurveEnc(cLin, gSat);
+                float3 ratio = clamp(log2(max(aHyb, 1e-4) / max(fHyb, 1e-4)), -1.5, 1.5);
+                float3 mulDelta = max(cLin, 0.0) * (exp2(ratio) - 1.0);
+                float cLum = dot(max(cLin, 0.0), float3(0.2126, 0.7152, 0.0722));
+                float fLum = dot(max(fHyb, 0.0), float3(0.2126, 0.7152, 0.0722));
+                float floorTrust = smoothstep(0.02, 0.12, min(cLum, fLum));
+                float3 dLin = lerp(dHyb, mulDelta, floorTrust);
+                if (gAlpha > 0.5) {
+                    float mRef = max(max(fHyb.r, max(fHyb.g, fHyb.b)), max(cEnc.r, max(cEnc.g, cEnc.b)));
+                    float fadeHi = 1.0 - smoothstep(0.92, 0.995, mRef);
+                    float maxLin = max(cLin.r, max(cLin.g, cLin.b));
+                    float peakGuard = 1.0 - smoothstep(400.0, 2000.0, maxLin);
+                    dLin *= fadeHi * peakGuard;
+                }
+                float3 resLin = max(cLin + dLin, 0.0) * div;
+                float3 outHdr;
+                if (hdrMode == 1) {
+                    float3 cClamped = clamp(cClean, -65504.0, 65504.0);
+                    float3 dWorld = resLin - max(cClamped, 0.0);
+                    outHdr = clamp(cClamped + dWorld, min(cClamped, 0.0), 65504.0);
+                } else {
+                    outHdr = saturate(LinearToPQ(max(Bt709To2020(resLin * (pqWhite / 10000.0)), 0.0)));
+                }
+                gDst[id.xy] = float4(outHdr, c.a);
+                return;
+            }
         } else {
             e = (a.rgb - f.rgb);
         }
@@ -3791,7 +4046,7 @@ static void SetPass(ID3D12GraphicsCommandList* cl, ID3D12PipelineState* pso,
                     UINT srv0, UINT srv1, UINT srv2, UINT srv3, UINT srv4,
                     UINT uav, UINT uav1, UINT w, UINT h,
                     ID3D12DescriptorHeap* a3Heap = nullptr, ID3D12RootSignature* a3Rs = nullptr,
-                    bool a3Bypass = false) {
+                    bool a3Bypass = false, UINT a3HdrMode = 0) {
     cl->SetPipelineState(pso);
     cl->SetComputeRootSignature(a3Rs ? a3Rs : g_rs.Get());
     D3D12_GPU_DESCRIPTOR_HANDLE b = (a3Heap ? a3Heap : g_heap.Get())->GetGPUDescriptorHandleForHeapStart();
@@ -3812,12 +4067,45 @@ static void SetPass(ID3D12GraphicsCommandList* cl, ID3D12PipelineState* pso,
     EnsurePreprocessLoadedFromIni();
     float dj = g_dejitter ? (float)g_dejitterSign : 0.0f;
     float ppGain = (g_ppExpMode == 0) ? 1.0f : exp2f((float)g_ppBias);
-    float c[20] = { 1.0f, (!a3Heap && g_ppOn) ? 1.0f : 0.0f, 0.0f, 1.0f, 1.0f, 1.0f, ppGain, 1.0f,
+    float c[20] = { 1.0f, (!a3Heap && g_ppOn) ? 1.0f : 0.0f, 0.0f,
+                    a3Heap ? (float)a3HdrMode : (float)g_bHdrMode,
+                    a3Heap ? (float)g_hdrCurve : 1.0f,
+                    a3Heap ? g_hdrChromaClamp : 1.0f,
+                    ppGain,
+                    a3Heap ? g_hdrPqWhiteNits : 1.0f,
                     MvScaleUv(), (float)g_ppCurve, (float)g_ppContrast, (float)g_mvConfIdx,
                     (float)g_ppSat, (float)g_gateIdx, (a3Heap ? a3Bypass : g_bypass) ? 1.0f : 0.0f,
                     (a3Heap || g_useGpuResid) ? 1.0f : 0.0f, g_curJitX, g_curJitY, dj, a3Heap ? 1.0f : 0.0f };
     cl->SetComputeRoot32BitConstants(7, 20, c, 0);
     cl->Dispatch((w + 7) / 8, (h + 7) / 8, 1);
+}
+
+static void SetScalePass(ID3D12GraphicsCommandList* cl, ID3D12PipelineState* pso,
+                         UINT baseSrv, UINT expSrv, UINT commitSrv, UINT scaleUav, UINT commitUav,
+                         ID3D12DescriptorHeap* heap, ID3D12RootSignature* rs,
+                         UINT hdrMode, bool useGameExp, float preExp, float expScale, bool snapNow) {
+    cl->SetPipelineState(pso);
+    cl->SetComputeRootSignature(rs);
+    D3D12_GPU_DESCRIPTOR_HANDLE b = heap->GetGPUDescriptorHandleForHeapStart();
+    auto tbl = [&](UINT slot) { D3D12_GPU_DESCRIPTOR_HANDLE h = b; h.ptr += (SIZE_T)slot * g_inc; return h; };
+    cl->SetComputeRootDescriptorTable(0, tbl(baseSrv));
+    cl->SetComputeRootDescriptorTable(1, tbl(expSrv));
+    cl->SetComputeRootDescriptorTable(2, tbl(commitSrv));
+    cl->SetComputeRootDescriptorTable(3, tbl(baseSrv));
+    cl->SetComputeRootDescriptorTable(4, tbl(baseSrv));
+    cl->SetComputeRootDescriptorTable(5, tbl(scaleUav));
+    cl->SetComputeRootDescriptorTable(6, tbl(commitUav));
+    float c[20] = {};
+    c[3]  = (float)hdrMode;
+    c[4]  = useGameExp ? 1.0f : 0.0f;
+    c[5]  = preExp > 1e-4f ? preExp : 1.0f;
+    c[6]  = expScale > 1e-4f ? expScale : 1.0f;
+    c[7]  = g_hdrPqWhiteNits;
+    c[8]  = g_hdrWhiteScale;
+    c[9]  = snapNow ? 1.0f : 0.0f;
+    c[10] = (float)g_hdrExpSource;
+    cl->SetComputeRoot32BitConstants(7, 20, c, 0);
+    cl->Dispatch(1, 1, 1);
 }
 
 // 跑马灯：在【我们自己的】g_netS 上画相位黑条（w/h 为网络尺寸）
@@ -4363,6 +4651,34 @@ static void TaaPollFile() {
     Log("TAA: 参数更新 alpha=%.2f clampK=%.2f", a, c);
 }
 
+static int BformResolveInputHdrMode() {
+    if (g_hdrOverride == 1) return 0;
+    if (g_hdrOverride == 2) return 1;
+    if (g_hdrOverride == 3) return 2;
+    if (g_bform4k) {
+        const int cs = g_scColorSpace.load(std::memory_order_relaxed);
+        const UINT fmt = g_scBbFmt.load(std::memory_order_relaxed);
+        const bool outHdr = g_scOutputHdr.load(std::memory_order_relaxed) != 0;
+        const bool apiHdr = g_a3LastIsHdrFlag.load(std::memory_order_relaxed);
+        if (cs == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020) return 2;
+        if (cs == DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709)   return 1;
+        if (cs == DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709)   return 0;
+        if (fmt == DXGI_FORMAT_R16G16B16A16_FLOAT) return 1;
+        if (fmt == DXGI_FORMAT_R10G10B10A2_UNORM && (outHdr || apiHdr)) return 2;
+        if (apiHdr && g_outpRes) {
+            const DXGI_FORMAT of = g_outpRes->GetDesc().Format;
+            if (of == DXGI_FORMAT_R16G16B16A16_FLOAT || of == DXGI_FORMAT_R11G11B10_FLOAT) return 1;
+            if (of == DXGI_FORMAT_R10G10B10A2_UNORM) return 2;
+        }
+        return 0;
+    }
+    if (g_a3LastIsHdrFlag.load(std::memory_order_relaxed) &&
+        (g_cfmt == DXGI_FORMAT_R16G16B16A16_FLOAT || g_cfmt == DXGI_FORMAT_R11G11B10_FLOAT)) {
+        return 1;
+    }
+    return 0;
+}
+
 static bool BformInit(ID3D12Device* dev, ID3D12Resource* color, ID3D12Resource* mv, ID3D12Resource* dep) {
     if (g_mvPackReady && g_mvPacked) mv = g_mvPacked.Get();   // 传的是打包后的 1080p MV
     if (!color || !mv || !dep) { Log("BFORM: 缺输入纹理，跳过初始化"); return false; }
@@ -4370,13 +4686,15 @@ static bool BformInit(ID3D12Device* dev, ID3D12Resource* color, ID3D12Resource* 
     D3D12_RESOURCE_DESC md = mv->GetDesc();
     D3D12_RESOURCE_DESC dd = dep->GetDesc();
 
+    g_bHdrMode = BformResolveInputHdrMode();
     g_upW = (UINT)cd.Width; g_upH = cd.Height; g_upFmtC = cd.Format;
     // ★ bform=9（4K 后置）：槽位与下游全部按【pOutput】的尺寸/格式 —— 底图是 XeSS 上采样之后的 4K
     if (g_bform4k && g_outpRes) {
         D3D12_RESOURCE_DESC od = g_outpRes->GetDesc();
         g_upW = (UINT)od.Width; g_upH = od.Height;
-        g_upFmtC = DXGI_FORMAT_B8G8R8A8_UNORM;   // ★ 传 8bit 转换结果（与 A 侧底图同为 BGRA）；10bit 直传实验已回退
-        Log("BFORM: 4K 后置模式 → 底图 %ux%u（8bit，由 pOutput 转换而来）", g_upW, g_upH);
+        g_upFmtC = (g_bHdrMode != 0) ? DXGI_FORMAT_R10G10B10A2_UNORM : DXGI_FORMAT_B8G8R8A8_UNORM;
+        Log("BFORM: 4K 后置模式 → 底图 %ux%u（%s，hdrMode=%d）",
+            g_upW, g_upH, (g_bHdrMode != 0) ? "HDR 10bit PQ" : "8bit", (int)g_bHdrMode);
     }
     g_upMw = (UINT)md.Width; g_upMh = md.Height; g_upFmtM = md.Format;
     g_upDw = (UINT)dd.Width; g_upDh = dd.Height; g_upFmtD = dd.Format;
@@ -4698,25 +5016,82 @@ static bool BformSlotMvToShared(ID3D12GraphicsCommandList* cl, ID3D12Resource* v
 // ---- B 形态 步骤3：B 侧自己把收到的 pColor 降采样到 1080p，直接喂给 NR ----
 //   这样 A 就不用再传 1080p（省 8.3MB/帧 + 一条通道）
 static const char* kBformDS = R"(
-cbuffer PpB : register(b0) { float gPpOn; float gPpGain; float gPpCurve; float gPpContrast; float gPpSat; };
+cbuffer PpB : register(b0) { float gPpOn; float gPpGain; float gPpCurve; float gPpContrast; float gPpSat; float gHdrMode; float gPqWhiteNits; float gHdrCurve; };
 Texture2D<float4>   gS : register(t0);
 SamplerState        gM : register(s0);
 RWTexture2D<float4> gD : register(u0);
+
+static const float kDsPqM1 = 2610.0 / 16384.0;
+static const float kDsPqM2 = 2523.0 / 32.0;
+static const float kDsPqC1 = 3424.0 / 4096.0;
+static const float kDsPqC2 = 2413.0 / 128.0;
+static const float kDsPqC3 = 2392.0 / 128.0;
+
+float3 DsCleanRgb(float3 c) {
+    if ((asuint(c.r) & 0x7F800000u) == 0x7F800000u) c.r = 0.0;
+    if ((asuint(c.g) & 0x7F800000u) == 0x7F800000u) c.g = 0.0;
+    if ((asuint(c.b) & 0x7F800000u) == 0x7F800000u) c.b = 0.0;
+    return c;
+}
+float3 DsPQToLinear(float3 pq) {
+    float3 s = saturate(DsCleanRgb(pq));
+    float3 p = pow(max(s, 1e-7), 1.0 / kDsPqM2);
+    float3 num = max(p - kDsPqC1, 0.0);
+    float3 den = max(kDsPqC2 - kDsPqC3 * p, 1e-6);
+    float3 res = pow(max(num / den, 1e-7), 1.0 / kDsPqM1);
+    return lerp(float3(0.0, 0.0, 0.0), res, step(1e-6, num) * step(1e-7, s));
+}
+float3 DsBt2020To709(float3 c) {
+    return float3(
+        dot(c, float3( 1.6604910, -0.5876411, -0.0728499)),
+        dot(c, float3(-0.1245505,  1.1328999, -0.0083494)),
+        dot(c, float3(-0.0181508, -0.1005789,  1.1187297))
+    );
+}
+float3 DsHybridEnc(float3 v) {
+    v = clamp(v, 0.0, 1000.0);
+    float m = max(v.r, max(v.g, v.b));
+    if (m <= 0.75) return v;
+    float e = (m - 0.75) * 4.0;
+    float h = 0.75 + 0.25 * (e * rsqrt(e * e + 1.0));
+    return v * (h / max(m, 1e-6));
+}
+float3 DsNeutwoEnc(float3 v) {
+    v = clamp(v, 0.0, 1000.0);
+    float m = max(v.r, max(v.g, v.b));
+    if (m <= 1e-6) return float3(0.0, 0.0, 0.0);
+    float h = m * rsqrt(m * m + 1.0);
+    return v * (h / m);
+}
+float3 DsSrgbEnc(float3 v) {
+    v = saturate(v);
+    float3 a = 12.92 * v;
+    float3 b = 1.055 * pow(max(v, 1e-8), 1.0 / 2.4) - 0.055;
+    return lerp(a, b, step(0.0031308, v));
+}
+
 [numthreads(8,8,1)]
 void main(uint3 id : SV_DispatchThreadID)
 {
     uint w, h; gD.GetDimensions(w, h);
     if (id.x >= w || id.y >= h) return;
     float2 uv = (float2(id.xy) + 0.5) / float2(w, h);
-    // ★ 与 A 侧 DownCS 对齐：2×2 区域平均（源比目标大约 1.16 倍，单点采样会混叠）
-    //   原来是单点双线性，导致 B 喂给网络的小图和 A 不是同一张 →
-    //   同一场景 A 的 |答案−喂入| ≈7~9、B 只有 2~6（差 3~4 倍）
     float2 t = float2(0.25 / float(w), 0.25 / float(h)) * 1.16;
     float4 c  = gS.SampleLevel(gM, uv + float2(-t.x, -t.y), 0);
     c += gS.SampleLevel(gM, uv + float2( t.x, -t.y), 0);
     c += gS.SampleLevel(gM, uv + float2(-t.x,  t.y), 0);
     c += gS.SampleLevel(gM, uv + float2( t.x,  t.y), 0);
-    gD[id.xy] = float4(PpApply(c.rgb * 0.25, gPpOn, gPpGain, gPpCurve, gPpContrast, gPpSat), 1.0);
+    float3 avg = DsCleanRgb(c.rgb * 0.25);
+    if (gHdrMode > 0.5) {
+        float pqWhite = max(gPqWhiteNits, 80.0);
+        float3 lin = (gHdrMode > 1.5)
+            ? max(DsBt2020To709(DsPQToLinear(avg) * (10000.0 / pqWhite)), 0.0)
+            : clamp(max(avg, 0.0), 0.0, 65504.0);
+        float3 enc = (gHdrCurve > 0.5) ? DsHybridEnc(lin) : DsNeutwoEnc(lin);
+        gD[id.xy] = float4(DsSrgbEnc(enc), 1.0);
+    } else {
+        gD[id.xy] = float4(PpApply(avg, gPpOn, gPpGain, gPpCurve, gPpContrast, gPpSat), 1.0);
+    }
 }
 )";
 static ComPtr<ID3D12RootSignature> g_bDsRs;
@@ -4752,7 +5127,7 @@ static bool BformBAuxEnsure(ID3D12Device* dev) {
     rp[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
     rp[2].Constants.ShaderRegister = 0;
     rp[2].Constants.RegisterSpace = 0;
-    rp[2].Constants.Num32BitValues = 5;
+    rp[2].Constants.Num32BitValues = 8;
     rp[2].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
     D3D12_STATIC_SAMPLER_DESC ss{};
     ss.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
@@ -4784,33 +5159,35 @@ static bool BformBEnsureDS(ID3D12Device* dev) {
     if (!dev) return false;
     if (!BformBAuxEnsure(dev)) return false;
     g_bDsRs = g_bAuxRs;
-    ComPtr<ID3DBlob> cs, e2;
-    std::string bdsSrc = std::string(kPreprocessHLSL) + kBformDS;
-    if (FAILED(D3DCompile(bdsSrc.data(), bdsSrc.size(), "bds.hlsl", nullptr, nullptr, "main", "cs_5_0",
-                          D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &cs, &e2))) {
-        Log("BFORM-B: DS 编译失败: %s", e2 ? (char*)e2->GetBufferPointer() : "?"); return false;
-    }
-    D3D12_COMPUTE_PIPELINE_STATE_DESC pd{};
-    pd.pRootSignature = g_bDsRs.Get();
-    pd.CS.pShaderBytecode = cs->GetBufferPointer();
-    pd.CS.BytecodeLength = cs->GetBufferSize();
-    {   HRESULT hr = dev->CreateComputePipelineState(&pd, IID_PPV_ARGS(&g_bDsPso));
+    if (!g_bDsPso) {
+        ComPtr<ID3DBlob> cs, e2;
+        std::string bdsSrc = std::string(kPreprocessHLSL) + kBformDS;
+        if (FAILED(D3DCompile(bdsSrc.data(), bdsSrc.size(), "bds.hlsl", nullptr, nullptr, "main", "cs_5_0",
+                              D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &cs, &e2))) {
+            Log("BFORM-B: DS 编译失败: %s", e2 ? (char*)e2->GetBufferPointer() : "?"); return false;
+        }
+        D3D12_COMPUTE_PIPELINE_STATE_DESC pd{};
+        pd.pRootSignature = g_bDsRs.Get();
+        pd.CS.pShaderBytecode = cs->GetBufferPointer();
+        pd.CS.BytecodeLength = cs->GetBufferSize();
+        HRESULT hr = dev->CreateComputePipelineState(&pd, IID_PPV_ARGS(&g_bDsPso));
         if (FAILED(hr)) { Log("BFORM-B: DS PSO 失败 0x%08X", (unsigned)hr); return false; }
     }
 
+    const DXGI_FORMAT dsFmt = (g_bHdrMode != 0) ? DXGI_FORMAT_R16G16B16A16_FLOAT : DXGI_FORMAT_R8G8B8A8_UNORM;
     D3D12_HEAP_PROPERTIES hp{}; hp.Type = D3D12_HEAP_TYPE_DEFAULT;
     D3D12_RESOURCE_DESC td{};
     td.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
     td.Width = kNetW; td.Height = kNetH;
     td.DepthOrArraySize = 1; td.MipLevels = 1;
-    td.Format = DXGI_FORMAT_R8G8B8A8_UNORM; td.SampleDesc.Count = 1;
+    td.Format = dsFmt; td.SampleDesc.Count = 1;
     td.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
     if (FAILED(dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &td,
             D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&g_bDs1080)))) {
         Log("BFORM-B: DS 纹理失败"); return false;
     }
     g_bDsReady = true;
-    Log("BFORM-B: 本地降采样就绪（%dx%d）", kNetW, kNetH);
+    Log("BFORM-B: 本地降采样就绪（%dx%d fmt=%d）", kNetW, kNetH, (int)dsFmt);
     return true;
 }
 
@@ -4838,8 +5215,9 @@ static bool BformBDownsample(ID3D12GraphicsCommandList* cl, ID3D12Resource* dst1
             h.ptr += (SIZE_T)i * g_bAuxInc;
             g_worker.dev->CreateUnorderedAccessView(r, nullptr, &ud, h);
         };
+        const DXGI_FORMAT dsFmt = (g_bHdrMode != 0) ? DXGI_FORMAT_R16G16B16A16_FLOAT : DXGI_FORMAT_R8G8B8A8_UNORM;
         mkS(g_bTexC.Get(), g_upFmtC, 0);
-        mkU(g_bDs1080.Get(), DXGI_FORMAT_R8G8B8A8_UNORM, 1);
+        mkU(g_bDs1080.Get(), dsFmt, 1);
         ID3D12DescriptorHeap* hs[] = { g_bAuxHeap.Get() };
         cl->SetDescriptorHeaps(1, hs);
         D3D12_GPU_DESCRIPTOR_HANDLE g = g_bAuxHeap->GetGPUDescriptorHandleForHeapStart();
@@ -4848,14 +5226,18 @@ static bool BformBDownsample(ID3D12GraphicsCommandList* cl, ID3D12Resource* dst1
         cl->SetComputeRootDescriptorTable(1, g1);
     }
     EnsurePreprocessLoadedFromIni();
-    float pp[5] = {
+    const float dsHdrMode = (g_bHdrMode != 0) ? ((g_bform4k || g_bHdrMode == 2) ? 2.0f : 1.0f) : 0.0f;
+    float pp[8] = {
         g_ppOn ? 1.0f : 0.0f,
         (g_ppExpMode == 0) ? 1.0f : exp2f((float)g_ppBias),
         (float)g_ppCurve,
         (float)g_ppContrast,
-        (float)g_ppSat
+        (float)g_ppSat,
+        dsHdrMode,
+        g_hdrPqWhiteNits,
+        (float)g_hdrCurve
     };
-    cl->SetComputeRoot32BitConstants(2, 5, pp, 0);
+    cl->SetComputeRoot32BitConstants(2, 8, pp, 0);
     cl->Dispatch((kNetW + 7) / 8, (kNetH + 7) / 8, 1);
     Barrier(cl, g_bDs1080.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
     // 注意：dst1080（NR 输入纹理）照抄现有做法，不额外加状态转换（跨 API 导入，沿用原约定）
@@ -4869,7 +5251,7 @@ static bool BformBDownsample(ID3D12GraphicsCommandList* cl, ID3D12Resource* dst1
 
 // ---- B 形态 步骤4：B 侧残差合成（把 A 的 ResidCS 搬到 B，答案改从纹理取）----
 //   输入：pColor(收到) + MV(收到) + 喂进 NR 的 1080p + NR 答案(纹理)
-//   输出：合成后的 pColor（供 S5 上采样用）；时域状态在 B 本地
+//   输出：合成后的 pColor（供 S5 上采样 / DComp 出画）；支持 SDR / scRGB FP16 / PQ HDR10
 static const char* kBformResid = R"(
 Texture2D<float4>   gSrc : register(t0);
 Texture2D<float4>   gRes : register(t1);
@@ -4881,16 +5263,76 @@ RWTexture2D<float4> gDst : register(u0);
 RWTexture2D<float4> gSt  : register(u1);
 cbuffer P : register(b0)
 {
-    // ★ 必须与 A 侧 SetPass 上传的 20 个常量【逐位对齐】（A 的 kHLSL 顺序）。
-    //   曾经这里只声明 8 个、且删掉了 edge/smooth/temporal，导致后面的
-    //   gain/sat/alpha/varGain/mvScale/mvConf/gateK 全部塌陷错位：
-    //   MV 缩放被喂成 alpha、方差门限被喂成 sat ⇒ 残差被重投影到错误位置后又抵消掉。
     float gLimit; float gEdge; float gSmooth; float gGain;
     float gSat; float gAlpha; float gVarGain; float gTemporal;
     float gMvScale; float gMvConf; float gMvIdx; float gConfIdx;
     float gGateK; float gGateIdx; float gMode; float gForce;
     float gLowCut; float gLowR; float gPad2; float gPad3;
 };
+static const float kBrPqM1 = 2610.0 / 16384.0;
+static const float kBrPqM2 = 2523.0 / 32.0;
+static const float kBrPqC1 = 3424.0 / 4096.0;
+static const float kBrPqC2 = 2413.0 / 128.0;
+static const float kBrPqC3 = 2392.0 / 128.0;
+float3 BrCleanRgb(float3 c) {
+    if ((asuint(c.r) & 0x7F800000u) == 0x7F800000u) c.r = 0.0;
+    if ((asuint(c.g) & 0x7F800000u) == 0x7F800000u) c.g = 0.0;
+    if ((asuint(c.b) & 0x7F800000u) == 0x7F800000u) c.b = 0.0;
+    return c;
+}
+float3 BrPQToLinear(float3 pq) {
+    float3 s = saturate(BrCleanRgb(pq));
+    float3 p = pow(max(s, 1e-7), 1.0 / kBrPqM2);
+    float3 num = max(p - kBrPqC1, 0.0);
+    float3 den = max(kBrPqC2 - kBrPqC3 * p, 1e-6);
+    float3 res = pow(max(num / den, 1e-7), 1.0 / kBrPqM1);
+    return lerp(float3(0.0, 0.0, 0.0), res, step(1e-6, num) * step(1e-7, s));
+}
+float3 BrLinearToPQ(float3 linNorm) {
+    float3 x = max(BrCleanRgb(linNorm), 0.0);
+    float3 lm = pow(max(x, 1e-7), kBrPqM1);
+    float3 pq = pow(max((kBrPqC1 + kBrPqC2 * lm) / max(1.0 + kBrPqC3 * lm, 1e-6), 1e-7), kBrPqM2);
+    return lerp(float3(0.0, 0.0, 0.0), saturate(pq), step(1e-7, x));
+}
+float3 BrBt2020To709(float3 c) {
+    return float3(
+        dot(c, float3( 1.6604910, -0.5876411, -0.0728499)),
+        dot(c, float3(-0.1245505,  1.1328999, -0.0083494)),
+        dot(c, float3(-0.0181508, -0.1005789,  1.1187297))
+    );
+}
+float3 BrBt709To2020(float3 c) {
+    return float3(
+        dot(c, float3(0.6274040, 0.3292830, 0.0433130)),
+        dot(c, float3(0.0690970, 0.9195400, 0.0113620)),
+        dot(c, float3(0.0163914, 0.0880133, 0.8955950))
+    );
+}
+float3 BrSrgbDec(float3 v) {
+    v = saturate(BrCleanRgb(v));
+    float3 a = v / 12.92;
+    float3 b = pow(max((v + 0.055) / 1.055, 1e-6), 2.4);
+    return lerp(a, b, step(0.04045, v));
+}
+float3 BrHybridEnc(float3 v) {
+    v = clamp(v, 0.0, 1000.0);
+    float m = max(v.r, max(v.g, v.b));
+    if (m <= 0.75) return v;
+    float e = (m - 0.75) * 4.0;
+    float h = 0.75 + 0.25 * (e * rsqrt(e * e + 1.0));
+    return v * (h / max(m, 1e-6));
+}
+float3 BrNeutwoEnc(float3 v) {
+    v = clamp(v, 0.0, 1000.0);
+    float m = max(v.r, max(v.g, v.b));
+    if (m <= 1e-6) return float3(0.0, 0.0, 0.0);
+    float h = m * rsqrt(m * m + 1.0);
+    return v * (h / m);
+}
+float3 BrHdrCurveEnc(float3 v, float curveId) {
+    return (curveId > 0.5) ? BrHybridEnc(v) : BrNeutwoEnc(v);
+}
+
 [numthreads(8,8,1)]
 void main(uint3 id : SV_DispatchThreadID)
 {
@@ -4901,12 +5343,44 @@ void main(uint3 id : SV_DispatchThreadID)
 
     float3 a = gAns.SampleLevel(gSmp, uv, 0).rgb;
     float3 f = gFed.SampleLevel(gSmp, uv, 0).rgb;
+
+    // HDR 路径：gGain=outHdr(1=scRGB FP16, 2=PQ HDR10), gEdge=inHdr(1=FP16, 2=PQ)
+    if (gGain > 0.5) {
+        float pqWhite = max(gTemporal, 80.0);
+        float3 cClean = BrCleanRgb(c.rgb);
+        float3 cLin = (gEdge > 1.5)
+            ? max(BrBt2020To709(BrPQToLinear(cClean) * (10000.0 / pqWhite)), 0.0)
+            : clamp(max(cClean, 0.0), 0.0, 65504.0);
+        float3 aHyb = BrSrgbDec(a);
+        float3 fHyb = BrSrgbDec(f);
+        float3 dHyb = aHyb - fHyb;
+        float3 cEnc = BrHdrCurveEnc(cLin, gSat);
+        float3 ratio = clamp(log2(max(aHyb, 1e-4) / max(fHyb, 1e-4)), -1.5, 1.5);
+        float3 mulDelta = max(cLin, 0.0) * (exp2(ratio) - 1.0);
+        float cLum = dot(max(cLin, 0.0), float3(0.2126, 0.7152, 0.0722));
+        float fLum = dot(max(fHyb, 0.0), float3(0.2126, 0.7152, 0.0722));
+        float floorTrust = smoothstep(0.02, 0.12, min(cLum, fLum));
+        float3 dLin = lerp(dHyb, mulDelta, floorTrust);
+        if (gAlpha > 0.5) {
+            float mRef = max(max(fHyb.r, max(fHyb.g, fHyb.b)), max(cEnc.r, max(cEnc.g, cEnc.b)));
+            float fadeHi = 1.0 - smoothstep(0.92, 0.995, mRef);
+            float maxLin = max(cLin.r, max(cLin.g, cLin.b));
+            float peakGuard = 1.0 - smoothstep(400.0, 2000.0, maxLin);
+            dLin *= fadeHi * peakGuard;
+        }
+        float3 resLin = max(cLin + dLin, 0.0);
+        if (gMode > 0.5 && gMode < 1.5) resLin = float3(1.0, 0.0, 1.0);
+        else if (gMode > 2.5 && gMode < 3.5) resLin = aHyb;
+        else if (gMode > 1.5) resLin = max(cLin + dLin + gForce, 0.0);
+        float3 outHdr = (gGain > 1.5)
+            ? saturate(BrLinearToPQ(max(BrBt709To2020(resLin * (pqWhite / 10000.0)), 0.0)))
+            : clamp(resLin * (pqWhite / 80.0), 0.0, 65504.0);
+        gDst[id.xy] = float4(outHdr, c.a);
+        return;
+    }
+
     float3 e = a - f;
 
-    // 【低频扣除】把残差的"局部均值"减掉，只保留高频细节修正。
-    //   为什么：网络输出偶尔整体偏亮/偏暗（同帧实测差过 20+ 灰阶），
-    //   全额叠上去会让整帧变亮变暗 → 表现为全图亮暗闪。
-    //   做法：8 个方向 + 自己共 9 点，在大半径 gLowR 上估均值（很便宜）。
     if (gLowCut > 0.5) {
         uint nw, nh; gFed.GetDimensions(nw, nh);
         float2 tx = float2(1.0 / float(nw), 1.0 / float(nh)) * gLowR;
@@ -4921,12 +5395,10 @@ void main(uint3 id : SV_DispatchThreadID)
         e -= se * (1.0 / 9.0);
     }
 
-    // 代理后处理关闭：保留当前 NR 残差，不读取或混合历史。
-        // ---- 探针 5（运行时切换；只作用于 B 侧合成）----
-    if (gMode > 0.5 && gMode < 1.5) { gDst[id.xy] = float4(1.0, 0.0, 1.0, 1.0); return; }  // 1=纯洋红
-    if (gMode > 2.5 && gMode < 3.5) { gDst[id.xy] = float4(a, 1.0); return; }               // 3=直接放答案
-    if (gMode > 1.5) { gDst[id.xy] = float4(saturate(c.rgb + e + gForce), c.a); return; }   // 2=强制叠加
-gDst[id.xy] = float4(saturate(c.rgb + e), c.a);
+    if (gMode > 0.5 && gMode < 1.5) { gDst[id.xy] = float4(1.0, 0.0, 1.0, 1.0); return; }
+    if (gMode > 2.5 && gMode < 3.5) { gDst[id.xy] = float4(a, 1.0); return; }
+    if (gMode > 1.5) { gDst[id.xy] = float4(saturate(c.rgb + e + gForce), c.a); return; }
+    gDst[id.xy] = float4(saturate(c.rgb + e), c.a);
 }
 )";
 // ★ 2026-10-31 F8 照搬到 B 形态：三横带诊断（写进 g_bComp，出画链路不变）
@@ -5034,74 +5506,79 @@ static ComPtr<ID3D12Resource> g_bComp[2], g_bState;
 static bool g_bStateCleared = false;
 static UINT g_bCompCnt = 0;
 
+static DXGI_FORMAT BformCompFormat() {
+    if (g_bHdrMode == 0) return DXGI_FORMAT_B8G8R8A8_UNORM;
+    if (g_bpFmt != DXGI_FORMAT_UNKNOWN && g_bpFmt != DXGI_FORMAT_B8G8R8A8_UNORM) return g_bpFmt;
+    return DXGI_FORMAT_R16G16B16A16_FLOAT;
+}
+
 // B heap: 0..5 input SRVs, 6=legacy PP UAV, 7=state, 8=F7 base, 9/10=compose UAVs.
 static bool BformBEnsureComp(ID3D12Device* dev) {
     if (g_bCompReady) return true;
     if (!dev || !g_bformReady || !g_upW) return false;
 
-    // ★ 每张表必须用【不同的寄存器】t0..t4 / u0 / u1；
-    //   全部用 t0 会让根签名序列化直接失败（0x80070057，已踩）
-    D3D12_DESCRIPTOR_RANGE rgS[5]{};
-    D3D12_DESCRIPTOR_RANGE rgU[2]{};
-    for (int i = 0; i < 5; ++i) {
-        rgS[i].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
-        rgS[i].NumDescriptors = 1;
-        rgS[i].BaseShaderRegister = (UINT)i;
-    }
-    for (int i = 0; i < 2; ++i) {
-        rgU[i].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
-        rgU[i].NumDescriptors = 1;
-        rgU[i].BaseShaderRegister = (UINT)i;
-    }
-    D3D12_ROOT_PARAMETER rp[8]{};
-    for (int i = 0; i < 5; ++i) {
-        rp[i].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-        rp[i].DescriptorTable.NumDescriptorRanges = 1;
-        rp[i].DescriptorTable.pDescriptorRanges = &rgS[i];
-        rp[i].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
-    }
-    rp[5].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-    rp[5].DescriptorTable.NumDescriptorRanges = 1;
-    rp[5].DescriptorTable.pDescriptorRanges = &rgU[0];
-    rp[5].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
-    rp[6].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-    rp[6].DescriptorTable.NumDescriptorRanges = 1;
-    rp[6].DescriptorTable.pDescriptorRanges = &rgU[1];
-    rp[6].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
-    rp[7].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
-    rp[7].Constants.ShaderRegister = 0;
-    rp[7].Constants.Num32BitValues = 20;
-    rp[7].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+    if (!g_bRs) {
+        D3D12_DESCRIPTOR_RANGE rgS[5]{};
+        D3D12_DESCRIPTOR_RANGE rgU[2]{};
+        for (int i = 0; i < 5; ++i) {
+            rgS[i].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+            rgS[i].NumDescriptors = 1;
+            rgS[i].BaseShaderRegister = (UINT)i;
+        }
+        for (int i = 0; i < 2; ++i) {
+            rgU[i].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
+            rgU[i].NumDescriptors = 1;
+            rgU[i].BaseShaderRegister = (UINT)i;
+        }
+        D3D12_ROOT_PARAMETER rp[8]{};
+        for (int i = 0; i < 5; ++i) {
+            rp[i].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+            rp[i].DescriptorTable.NumDescriptorRanges = 1;
+            rp[i].DescriptorTable.pDescriptorRanges = &rgS[i];
+            rp[i].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+        }
+        rp[5].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+        rp[5].DescriptorTable.NumDescriptorRanges = 1;
+        rp[5].DescriptorTable.pDescriptorRanges = &rgU[0];
+        rp[5].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+        rp[6].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+        rp[6].DescriptorTable.NumDescriptorRanges = 1;
+        rp[6].DescriptorTable.pDescriptorRanges = &rgU[1];
+        rp[6].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+        rp[7].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+        rp[7].Constants.ShaderRegister = 0;
+        rp[7].Constants.Num32BitValues = 20;
+        rp[7].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
 
-    D3D12_STATIC_SAMPLER_DESC ss{};
-    ss.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
-    ss.AddressU = ss.AddressV = ss.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
-    ss.ComparisonFunc = D3D12_COMPARISON_FUNC_ALWAYS;
-    ss.MaxLOD = D3D12_FLOAT32_MAX;
-    ss.ShaderRegister = 0;
-    ss.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+        D3D12_STATIC_SAMPLER_DESC ss{};
+        ss.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
+        ss.AddressU = ss.AddressV = ss.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+        ss.ComparisonFunc = D3D12_COMPARISON_FUNC_ALWAYS;
+        ss.MaxLOD = D3D12_FLOAT32_MAX;
+        ss.ShaderRegister = 0;
+        ss.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
 
-    D3D12_ROOT_SIGNATURE_DESC rd{};
-    rd.NumParameters = 8; rd.pParameters = rp;
-    rd.NumStaticSamplers = 1; rd.pStaticSamplers = &ss;
-    ComPtr<ID3DBlob> sig, err;
-    if (FAILED(D3D12SerializeRootSignature(&rd, D3D_ROOT_SIGNATURE_VERSION_1, &sig, &err))) {
-        Log("BFORM-B: 合成根签名失败"); return false;
+        D3D12_ROOT_SIGNATURE_DESC rd{};
+        rd.NumParameters = 8; rd.pParameters = rp;
+        rd.NumStaticSamplers = 1; rd.pStaticSamplers = &ss;
+        ComPtr<ID3DBlob> sig, err;
+        if (FAILED(D3D12SerializeRootSignature(&rd, D3D_ROOT_SIGNATURE_VERSION_1, &sig, &err))) {
+            Log("BFORM-B: 合成根签名失败"); return false;
+        }
+        if (FAILED(dev->CreateRootSignature(0, sig->GetBufferPointer(), sig->GetBufferSize(), IID_PPV_ARGS(&g_bRs)))) return false;
     }
-    if (FAILED(dev->CreateRootSignature(0, sig->GetBufferPointer(), sig->GetBufferSize(), IID_PPV_ARGS(&g_bRs)))) return false;
+    if (!g_bPso) {
+        ComPtr<ID3DBlob> cs, e2;
+        if (FAILED(D3DCompile(kBformResid, strlen(kBformResid), "bres.hlsl", nullptr, nullptr, "main", "cs_5_0",
+                              D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &cs, &e2))) {
+            Log("BFORM-B: 合成 shader 编译失败: %s", e2 ? (char*)e2->GetBufferPointer() : "?"); return false;
+        }
+        D3D12_COMPUTE_PIPELINE_STATE_DESC pd{};
+        pd.pRootSignature = g_bRs.Get();
+        pd.CS.pShaderBytecode = cs->GetBufferPointer();
+        pd.CS.BytecodeLength = cs->GetBufferSize();
+        if (FAILED(dev->CreateComputePipelineState(&pd, IID_PPV_ARGS(&g_bPso)))) { Log("BFORM-B: 合成 PSO 失败"); return false; }
 
-    ComPtr<ID3DBlob> cs, e2;
-    if (FAILED(D3DCompile(kBformResid, strlen(kBformResid), "bres.hlsl", nullptr, nullptr, "main", "cs_5_0",
-                          D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &cs, &e2))) {
-        Log("BFORM-B: 合成 shader 编译失败: %s", e2 ? (char*)e2->GetBufferPointer() : "?"); return false;
-    }
-    D3D12_COMPUTE_PIPELINE_STATE_DESC pd{};
-    pd.pRootSignature = g_bRs.Get();
-    pd.CS.pShaderBytecode = cs->GetBufferPointer();
-    pd.CS.BytecodeLength = cs->GetBufferSize();
-    if (FAILED(dev->CreateComputePipelineState(&pd, IID_PPV_ARGS(&g_bPso)))) { Log("BFORM-B: 合成 PSO 失败"); return false; }
-
-    {   // ★ F8：三横带诊断 PSO（同一个根签名，只换 shader；编译失败只是没有诊断视图）
         ComPtr<ID3DBlob> ct, et;
         if (SUCCEEDED(D3DCompile(kBformTri, strlen(kBformTri), "btri.hlsl", nullptr, nullptr, "main", "cs_5_0",
                                  D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &ct, &et))) {
@@ -5113,9 +5590,7 @@ static bool BformBEnsureComp(ID3D12Device* dev) {
         } else {
             Log("BFORM-B: 三横带 shader 编译失败: %s", et ? (char*)et->GetBufferPointer() : "?");
         }
-    }
 
-    {   // ★ F7：跑马灯 PSO（同一个根签名，只换 shader）
         ComPtr<ID3DBlob> cm, em;
         if (SUCCEEDED(D3DCompile(kBformMark, strlen(kBformMark), "bmark.hlsl", nullptr, nullptr, "main", "cs_5_0",
                                  D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &cm, &em))) {
@@ -5128,13 +5603,14 @@ static bool BformBEnsureComp(ID3D12Device* dev) {
             Log("BFORM-B: 跑马灯 shader 编译失败: %s", em ? (char*)em->GetBufferPointer() : "?");
         }
     }
-
-    D3D12_DESCRIPTOR_HEAP_DESC hd{};
-    hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-    hd.NumDescriptors = 11;  // separate descriptor locations for the two compose targets
-    hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
-    if (FAILED(dev->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&g_bHeap)))) { Log("BFORM-B: 合成堆失败"); return false; }
-    g_bInc = dev->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    if (!g_bHeap) {
+        D3D12_DESCRIPTOR_HEAP_DESC hd{};
+        hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+        hd.NumDescriptors = 11;  // separate descriptor locations for the two compose targets
+        hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+        if (FAILED(dev->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&g_bHeap)))) { Log("BFORM-B: 合成堆失败"); return false; }
+        g_bInc = dev->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    }
 
     D3D12_HEAP_PROPERTIES hp{}; hp.Type = D3D12_HEAP_TYPE_DEFAULT;
     auto mkuav = [&](UINT w, UINT h, DXGI_FORMAT fmt, ComPtr<ID3D12Resource>& r, const char* nm) -> bool {
@@ -5149,12 +5625,12 @@ static bool BformBEnsureComp(ID3D12Device* dev) {
         }
         return true;
     };
-    // 合成输出固定 8bit：底图可能是 10bit（pOutput 原生），但合成/出画这条链保持 8bit
-    //   （交换链也因此保持 8bit，避开"10bit swapchain + DComp + 8bit 桌面"的闪烁问题）
+    const DXGI_FORMAT compFmt = BformCompFormat();
+    const DXGI_FORMAT netFmt = (g_bHdrMode != 0) ? DXGI_FORMAT_R16G16B16A16_FLOAT : DXGI_FORMAT_R8G8B8A8_UNORM;
     ComPtr<ID3D12Resource> outputs[2], state;
     for (auto& output : outputs)
-        if (!mkuav(g_upW, g_upH, DXGI_FORMAT_B8G8R8A8_UNORM, output, "输出")) return false;
-    if (!mkuav(kNetW, kNetH, DXGI_FORMAT_R8G8B8A8_UNORM, state, "状态")) return false;
+        if (!mkuav(g_upW, g_upH, compFmt, output, "输出")) return false;
+    if (!mkuav(kNetW, kNetH, netFmt, state, "状态")) return false;
     for (int i = 0; i < 2; ++i) {
         g_bComp[i].Swap(outputs[i]);
         g_bCompStamp[i] = {};
@@ -5163,13 +5639,14 @@ static bool BformBEnsureComp(ID3D12Device* dev) {
 
     D3D12_CPU_DESCRIPTOR_HANDLE c = g_bHeap->GetCPUDescriptorHandleForHeapStart();
     auto at = [&](int i) { D3D12_CPU_DESCRIPTOR_HANDLE h = c; h.ptr += (SIZE_T)i * g_bInc; return h; };
-    { D3D12_UNORDERED_ACCESS_VIEW_DESC ud{}; ud.Format = DXGI_FORMAT_B8G8R8A8_UNORM; ud.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+    { D3D12_UNORDERED_ACCESS_VIEW_DESC ud{}; ud.Format = compFmt; ud.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
       for (int i = 0; i < 2; ++i) dev->CreateUnorderedAccessView(g_bComp[i].Get(), nullptr, &ud, at(9 + i)); }
-    { D3D12_UNORDERED_ACCESS_VIEW_DESC ud{}; ud.Format = DXGI_FORMAT_R8G8B8A8_UNORM; ud.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+    { D3D12_UNORDERED_ACCESS_VIEW_DESC ud{}; ud.Format = netFmt; ud.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
       dev->CreateUnorderedAccessView(g_bState.Get(), nullptr, &ud, at(7)); }
 
     g_bCompReady = true;
-    Log("BFORM-B: 残差合成就绪 | 输出 %ux%u | 状态 %ux%u", g_upW, g_upH, kNetW, kNetH);
+    Log("BFORM-B: 残差合成就绪 | 输出 %ux%u fmt=%d | 状态 %ux%u fmt=%d",
+        g_upW, g_upH, (int)compFmt, kNetW, kNetH, (int)netFmt);
     return true;
 }
 
@@ -5187,14 +5664,16 @@ static bool BformBCompose(ID3D12GraphicsCommandList* cl, ID3D12Resource* ansTex,
                 g_tlIter, BtPtr(g_bpFe ? g_bpFe.Get() : nullptr),
                 (unsigned long long)g_bCompStamp[slot].lastPresentFv, (unsigned long long)comp, valid);
     }
-    {   // 【诊断·一次性】答案纹理描述 vs 我们建 SRV 时写死的格式（这里两个都在作用域里）
+    const DXGI_FORMAT netFmt = (g_bHdrMode != 0) ? DXGI_FORMAT_R16G16B16A16_FLOAT : DXGI_FORMAT_R8G8B8A8_UNORM;
+    const DXGI_FORMAT ansFmt = ansTex->GetDesc().Format;
+    {   // 【诊断·一次性】答案纹理描述 vs 合成底色格式
         static bool l1 = false;
         if (!l1) {
             l1 = true;
             D3D12_RESOURCE_DESC ad = ansTex->GetDesc();
-            Log("DIAG-PO2: 答案 fmt=%d %ux%u array=%u mip=%u | 我们的SRV=R8G8B8A8_UNORM | 合成底色 fmt=%d %ux%u",
+            Log("DIAG-PO2: 答案 fmt=%d %ux%u array=%u mip=%u | netFmt=%d | 合成底色 fmt=%d %ux%u",
                 (int)ad.Format, (UINT)ad.Width, (UINT)ad.Height, ad.DepthOrArraySize, ad.MipLevels,
-                (int)g_upFmtC, g_upW, g_upH);
+                (int)netFmt, (int)g_upFmtC, g_upW, g_upH);
         }
     }
     D3D12_CPU_DESCRIPTOR_HANDLE c = g_bHeap->GetCPUDescriptorHandleForHeapStart();
@@ -5210,8 +5689,8 @@ static bool BformBCompose(ID3D12GraphicsCommandList* cl, ID3D12Resource* ansTex,
     mksrv(g_bTexC.Get(), g_upFmtC, 0);
     mksrv(g_bTexC.Get(), g_upFmtC, 1);          // 占位
     mksrv(g_bTexM.Get(), g_upFmtM, 2);
-    mksrv(g_bDs1080.Get(), DXGI_FORMAT_R8G8B8A8_UNORM, 3);
-    mksrv(ansTex, DXGI_FORMAT_R8G8B8A8_UNORM, 4);
+    mksrv(g_bDs1080.Get(), netFmt, 3);
+    mksrv(ansTex, ansFmt, 4);
     mksrv(g_bTexC.Get(), g_upFmtC, 5);          // 占位
 
     Barrier(cl, g_bTexC.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
@@ -5233,8 +5712,13 @@ static bool BformBCompose(ID3D12GraphicsCommandList* cl, ID3D12Resource* ansTex,
     cl->SetComputeRootDescriptorTable(4, gpu(4));
     cl->SetComputeRootDescriptorTable(5, gpu(9 + slot));
     cl->SetComputeRootDescriptorTable(6, gpu(7));
-    // 保持 A/B 常量布局一致；后处理常量中性且不使用历史状态。
-    float k[20] = { 1.0f, 0.0f, 0.0f, 1.0f, 1.0f, 1.0f, 0.0f, 1.0f,
+    const float inHdr = (g_bHdrMode != 0) ? ((g_bform4k || g_bHdrMode == 2) ? 2.0f : 1.0f) : 0.0f;
+    int outHdrI = 0;
+    if (g_bHdrMode != 0) {
+        outHdrI = g_bOutHdrMode.load(std::memory_order_relaxed);
+        if (outHdrI == 0) outHdrI = (BformCompFormat() == DXGI_FORMAT_R10G10B10A2_UNORM) ? 2 : 1;
+    }
+    float k[20] = { 1.0f, inHdr, 0.0f, (float)outHdrI, (float)g_hdrCurve, g_hdrChromaClamp, 0.0f, g_hdrPqWhiteNits,
                     MvScaleUv(), 0, 0, 0, 0, 0,
                     (float)g_diag5Mode, (g_diag5Mode == 2) ? 0.2f : 0.0f,
                     (g_diag5Mode == 4) ? 1.0f : 0.0f, (g_diag5Mode == 4) ? 12.0f : 0.0f, 0, 0 };
@@ -5415,30 +5899,33 @@ static bool BformBEnsureUp(ID3D12Device* dev) {
     if (!dev || !g_outW || !g_outH) return false;
     if (!BformBAuxEnsure(dev)) return false;
     g_bUpRs = g_bAuxRs;                 // 与 DS 共用"描述符表 + 静态采样器"的根签名
-    ComPtr<ID3DBlob> cs, e2;
-    if (FAILED(D3DCompile(kBformUp, strlen(kBformUp), "bup.hlsl", nullptr, nullptr, "main", "cs_5_0",
-                          D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &cs, &e2))) {
-        Log("BFORM-B: UP 编译失败: %s", e2 ? (char*)e2->GetBufferPointer() : "?"); return false;
+    if (!g_bUpPso) {
+        ComPtr<ID3DBlob> cs, e2;
+        if (FAILED(D3DCompile(kBformUp, strlen(kBformUp), "bup.hlsl", nullptr, nullptr, "main", "cs_5_0",
+                              D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &cs, &e2))) {
+            Log("BFORM-B: UP 编译失败: %s", e2 ? (char*)e2->GetBufferPointer() : "?"); return false;
+        }
+        D3D12_COMPUTE_PIPELINE_STATE_DESC pd{};
+        pd.pRootSignature = g_bUpRs.Get();
+        pd.CS.pShaderBytecode = cs->GetBufferPointer();
+        pd.CS.BytecodeLength = cs->GetBufferSize();
+        if (FAILED(dev->CreateComputePipelineState(&pd, IID_PPV_ARGS(&g_bUpPso)))) { Log("BFORM-B: UP PSO 失败"); return false; }
     }
-    D3D12_COMPUTE_PIPELINE_STATE_DESC pd{};
-    pd.pRootSignature = g_bUpRs.Get();
-    pd.CS.pShaderBytecode = cs->GetBufferPointer();
-    pd.CS.BytecodeLength = cs->GetBufferSize();
-    if (FAILED(dev->CreateComputePipelineState(&pd, IID_PPV_ARGS(&g_bUpPso)))) { Log("BFORM-B: UP PSO 失败"); return false; }
 
+    const DXGI_FORMAT upFmt = BformCompFormat();
     D3D12_HEAP_PROPERTIES hp{}; hp.Type = D3D12_HEAP_TYPE_DEFAULT;
     D3D12_RESOURCE_DESC td{};
     td.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
     td.Width = g_outW; td.Height = g_outH;
     td.DepthOrArraySize = 1; td.MipLevels = 1;
-    td.Format = g_upFmtC; td.SampleDesc.Count = 1;
+    td.Format = upFmt; td.SampleDesc.Count = 1;
     td.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
     if (FAILED(dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &td,
             D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&g_bUp4k)))) {
         Log("BFORM-B: UP 纹理失败"); return false;
     }
     g_bUpReady = true;
-    Log("BFORM-B: 上采样就绪 | %ux%u -> %ux%u", g_upW, g_upH, g_outW, g_outH);
+    Log("BFORM-B: 上采样就绪 | %ux%u -> %ux%u fmt=%d", g_upW, g_upH, g_outW, g_outH, (int)upFmt);
     return true;
 }
 
@@ -5517,7 +6004,7 @@ static double BlkDiff(const unsigned char* a, UINT pa, const unsigned char* b, U
 static bool g_diagPending = false;
 static void BformDiagEnqueue(Worker& W, ID3D12Resource* ans, int slot, bool upWritten) {
     static int tick = 0;
-    if (!g_bformOn) return;
+    if (!g_bformOn || g_bHdrMode != 0) return;
     const int m = tick++ % 150;
     if (m != 0 && m != 1) return;   // 每 150 帧【连续采两帧】：用于"答案延迟"测量（第 2 帧比第 1 帧的喂入）
     if (!g_bCompReady || !g_bUpReady || !g_bTexC || !g_bComp[slot] || !g_bUp4k || !g_bDs1080) {
@@ -5639,8 +6126,9 @@ static bool BformBUpscale(ID3D12GraphicsCommandList* cl, int slot) {
             h.ptr += (SIZE_T)i * g_bAuxInc;
             g_worker.dev->CreateUnorderedAccessView(r, nullptr, &ud, h);
         };
-        mkS(g_bComp[slot].Get(), DXGI_FORMAT_B8G8R8A8_UNORM, 2);
-        mkU(g_bUp4k.Get(), g_upFmtC, 3);
+        const DXGI_FORMAT upFmt = BformCompFormat();
+        mkS(g_bComp[slot].Get(), upFmt, 2);
+        mkU(g_bUp4k.Get(), upFmt, 3);
         ID3D12DescriptorHeap* hs[] = { g_bAuxHeap.Get() };
         cl->SetDescriptorHeaps(1, hs);
         D3D12_GPU_DESCRIPTOR_HANDLE g = g_bAuxHeap->GetGPUDescriptorHandleForHeapStart();
@@ -5873,7 +6361,6 @@ static int g_bpAi = 0;
 static UINT64 g_bpAlFv[2] = {};
 static ComPtr<ID3D12GraphicsCommandList> g_bpCl, g_bpCl2;
 static UINT   g_bpCnt = 0;
-static DXGI_FORMAT g_bpFmt = DXGI_FORMAT_UNKNOWN;
 static ComPtr<IDCompositionScaleTransform> g_bpScale;   // 覆盖层缩放（跟随窗口客户区）
 static UINT g_bpCw = 0, g_bpCh = 0;                     // 建立缩放时用的客户区尺寸
 // 出画节奏统计（判断"卡卡的"是不是因为出画间隔不匀）
@@ -5891,10 +6378,34 @@ static void BformPresentShow(bool show) {
     ApplyOverlay();
 }
 
+static void BformResetWorkerResources() {
+    if (g_worker.fe && g_worker.fv > 0) WaitWFence(g_worker.fv, kWorkerWaitMs);
+    if (g_bpFe && g_bpFv > 0) {
+        ULONGLONG t0 = GetTickCount64();
+        while (g_bpFe->GetCompletedValue() < g_bpFv && (GetTickCount64() - t0) < 200) SwitchToThread();
+    }
+    BformPresentShow(false);
+    if (g_bpVisual) g_bpVisual->SetContent(nullptr);
+    if (g_bpDcomp) g_bpDcomp->Commit();
+    g_bpReady = false; g_bpFailed = false; g_bpSyncBroken = false;
+    g_bpScale.Reset(); g_bpVisual.Reset(); g_bpTarget.Reset(); g_bpDcomp.Reset();
+    g_bpSc.Reset(); g_bpQ.Reset(); g_bpAl.Reset(); g_bpAl2.Reset(); g_bpCl.Reset(); g_bpCl2.Reset(); g_bpFe.Reset();
+    g_bpFv = 0; g_bpAlFv[0] = g_bpAlFv[1] = 0; g_bpAi = 0;
+    g_bpFmt = DXGI_FORMAT_UNKNOWN;
+    g_bOutHdrMode.store(0, std::memory_order_relaxed);
+    g_bTexReady = false; g_bTexC.Reset(); g_bTexM.Reset(); g_bTexD.Reset();
+    g_bDsReady = false; g_bDs1080.Reset();
+    g_bCompReady = false; g_bComp[0].Reset(); g_bComp[1].Reset(); g_bState.Reset(); g_bCompFailNgx = false;
+    g_bCompStamp[0] = {}; g_bCompStamp[1] = {};
+    g_bUpReady = false; g_bUp4k.Reset(); g_bUpComposeFv = 0; g_bUpLastPresentFv = 0;
+    g_taaReady = false; g_taaValid = false; g_taaHist[0].Reset(); g_taaHist[1].Reset(); g_taaOut.Reset();
+    Log("BFORM-HDR: B 侧资源已安全释放，等待按新 HDR 模式重建");
+}
+
 static bool BformPresentInit() {
     if (g_bpReady) return true;
     if (g_bpFailed) return false;
-    if (!g_worker.dev || !g_bUp4k) { return false; }
+    if (!g_worker.dev || !g_outW || !g_outH) { return false; }
     // 自己去找窗口（以前这里是"直接放弃 → 只能靠用户按 Del 开菜单顺带取到句柄"）
     if (!ResolveGameHwnd()) { static int n = 0; if ((n++ % 300) == 0) Log("BFORM-P: 还没定位到游戏主窗口，稍后重试（无需开菜单）"); return false; }
 
@@ -5919,22 +6430,74 @@ static bool BformPresentInit() {
         FAILED(g_bpCl2->Close())) { g_bpFailed = true; return false; }
     if (FAILED(g_worker.dev->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&g_bpFe)))) { g_bpFailed = true; return false; }
 
-    // 合成交换链：格式与 g_bUp4k 一致，才能直接 CopyResource
+    // 合成交换链：按当前 HDR 形态匹配（HDR10 PQ 优先 R10G10B10A2+G2084_P2020；scRGB 优先 FP16+G10_P709）
     DXGI_SWAP_CHAIN_DESC1 sd{};
     sd.Width = g_outW; sd.Height = g_outH;
-    sd.Format = DXGI_FORMAT_B8G8R8A8_UNORM;   // 固定 8bit（与合成输出一致；底图 10bit 也不影响这里）
     sd.SampleDesc.Count = 1;
     sd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
     sd.BufferCount = 2;
     sd.Scaling = DXGI_SCALING_STRETCH;
     sd.SwapEffect = DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL;
     sd.AlphaMode = DXGI_ALPHA_MODE_IGNORE;
-    ComPtr<IDXGISwapChain1> sc1;
-    HRESULT hr = fac4->CreateSwapChainForComposition(g_bpQ.Get(), &sd, nullptr, &sc1);
-    if (FAILED(hr) || !sc1) { Log("BFORM-P: 合成交换链失败 0x%08X（B 可能没有输出）", (unsigned)hr); g_bpFailed = true; return false; }
-    if (FAILED(sc1.As(&g_bpSc)) || !g_bpSc) { Log("BFORM-P: QI 失败"); g_bpFailed = true; return false; }
-    g_bpSc->SetColorSpace1(DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709);
-    g_bpFmt = g_upFmtC;
+
+    auto trySwap = [&](DXGI_FORMAT fmt, DXGI_COLOR_SPACE_TYPE cs) -> bool {
+        sd.Format = fmt;
+        ComPtr<IDXGISwapChain1> sc1;
+        HRESULT hr = fac4->CreateSwapChainForComposition(g_bpQ.Get(), &sd, nullptr, &sc1);
+        if (FAILED(hr) || !sc1) {
+            Log("BFORM-P: CreateSwapChainForComposition 失败 fmt=%d hr=0x%08X", (int)fmt, (unsigned)hr);
+            return false;
+        }
+        ComPtr<IDXGISwapChain3> sc3;
+        if (FAILED(sc1.As(&sc3)) || !sc3) return false;
+        if (fmt != DXGI_FORMAT_B8G8R8A8_UNORM) {
+            UINT sup = 0;
+            HRESULT hrSup = sc3->CheckColorSpaceSupport(cs, &sup);
+            if (FAILED(hrSup) || !(sup & DXGI_SWAP_CHAIN_COLOR_SPACE_SUPPORT_FLAG_PRESENT)) {
+                Log("BFORM-P: CheckColorSpaceSupport 提示未完整声明 fmt=%d cs=%d (hr=0x%08X sup=0x%X)，仍尝试 SetColorSpace1",
+                    (int)fmt, (int)cs, (unsigned)hrSup, sup);
+            }
+            HRESULT hrCs = sc3->SetColorSpace1(cs);
+            if (FAILED(hrCs)) {
+                Log("BFORM-P: SetColorSpace1 失败 fmt=%d cs=%d hr=0x%08X", (int)fmt, (int)cs, (unsigned)hrCs);
+                return false;
+            }
+        } else {
+            sc3->SetColorSpace1(cs);
+        }
+        g_bpSc = sc3;
+        return true;
+    };
+
+    int outHdrMode = 0;
+    if (g_bHdrMode == 2) {
+        if (trySwap(DXGI_FORMAT_R10G10B10A2_UNORM, DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020)) {
+            outHdrMode = 2;
+            Log("BFORM-P: DComp 合成交换链启用 PQ HDR10 (R10G10B10A2 + G2084_P2020)");
+        } else if (trySwap(DXGI_FORMAT_R16G16B16A16_FLOAT, DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709)) {
+            outHdrMode = 1;
+            Log("BFORM-P: DComp 合成交换链回退 scRGB FP16 (G10_P709)");
+        }
+    } else if (g_bHdrMode == 1) {
+        if (trySwap(DXGI_FORMAT_R16G16B16A16_FLOAT, DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709)) {
+            outHdrMode = 1;
+            Log("BFORM-P: DComp 合成交换链启用 scRGB FP16 (G10_P709)");
+        } else if (trySwap(DXGI_FORMAT_R10G10B10A2_UNORM, DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020)) {
+            outHdrMode = 2;
+            Log("BFORM-P: DComp 合成交换链回退 PQ HDR10 (R10G10B10A2 + G2084_P2020)");
+        }
+    }
+    if (outHdrMode == 0) {
+        if (!trySwap(DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709)) {
+            Log("BFORM-P: 合成交换链失败（B 可能没有输出）"); g_bpFailed = true; return false;
+        }
+    }
+    g_bpFmt = sd.Format;
+    g_bOutHdrMode.store(outHdrMode, std::memory_order_relaxed);
+    if (g_bCompReady && g_bComp[0] && g_bComp[0]->GetDesc().Format != BformCompFormat()) {
+        g_bCompReady = false;
+    }
+    HRESULT hr = S_OK;
 
     // DComp 设备（D3D12 设备不能当 IDXGIDevice，失败则用同卡 D3D11 设备）
     hr = DCompositionCreateDevice(nullptr, IID_PPV_ARGS(&g_bpDcomp));
@@ -6011,6 +6574,10 @@ static bool BformPresentFrame(int slot, UINT64 composeFv, bool keepalive) {
     UINT bi = g_bpSc->GetCurrentBackBufferIndex();
     ComPtr<ID3D12Resource> bb;
     if (FAILED(g_bpSc->GetBuffer(bi, IID_PPV_ARGS(&bb))) || !bb) return false;
+    if (bb->GetDesc().Format != src->GetDesc().Format) {
+        if (!direct4k) g_bCompReady = false;
+        return false;
+    }
     const UINT64 done = g_bpFe->GetCompletedValue();
     if (done == UINT64_MAX) { NrHardFail("B1: present fence device removed"); return false; }
     int batch = g_bpAi ^ 1;
@@ -6400,11 +6967,84 @@ static const char* kAdd4KTemplate = R"HLSL(
 //   u0 = 输出(4K)        s0 = 采样器
 // 注意：t1 / t2 是 pColor 几何（可能 2560x1440），尺寸必须用 GetDimensions 问，不要硬编码。
 
+cbuffer P : register(b0) { float4 gC[5]; };
+
 Texture2D<float4>   gSrc : register(t0);
 Texture2D<float4>   gRes : register(t1);
 Texture2D<float4>   gMV  : register(t2);
 SamplerState        gSmp : register(s0);
 RWTexture2D<float4> gDst : register(u0);
+
+static const float kAddPqM1 = 2610.0 / 16384.0;
+static const float kAddPqM2 = 2523.0 / 32.0;
+static const float kAddPqC1 = 3424.0 / 4096.0;
+static const float kAddPqC2 = 2413.0 / 128.0;
+static const float kAddPqC3 = 2392.0 / 128.0;
+
+float3 AddCleanRgb(float3 c) {
+    if ((asuint(c.r) & 0x7F800000u) == 0x7F800000u) c.r = 0.0;
+    if ((asuint(c.g) & 0x7F800000u) == 0x7F800000u) c.g = 0.0;
+    if ((asuint(c.b) & 0x7F800000u) == 0x7F800000u) c.b = 0.0;
+    return c;
+}
+float3 AddPQToLin(float3 pq) {
+    float3 s = saturate(AddCleanRgb(pq));
+    float3 p = pow(max(s, 1e-7), 1.0 / kAddPqM2);
+    float3 num = max(p - kAddPqC1, 0.0);
+    float3 den = max(kAddPqC2 - kAddPqC3 * p, 1e-6);
+    float3 res = pow(max(num / den, 1e-7), 1.0 / kAddPqM1);
+    return lerp(float3(0.0, 0.0, 0.0), res, step(1e-6, num) * step(1e-7, s));
+}
+float3 AddLinToPQ(float3 linNorm) {
+    float3 x = max(AddCleanRgb(linNorm), 0.0);
+    float3 lm = pow(max(x, 1e-7), kAddPqM1);
+    float3 pq = pow(max((kAddPqC1 + kAddPqC2 * lm) / max(1.0 + kAddPqC3 * lm, 1e-6), 1e-7), kAddPqM2);
+    return lerp(float3(0.0, 0.0, 0.0), saturate(pq), step(1e-7, x));
+}
+float3 AddBt2020To709(float3 c) {
+    return float3(
+        dot(c, float3( 1.6604910, -0.5876411, -0.0728499)),
+        dot(c, float3(-0.1245505,  1.1328999, -0.0083494)),
+        dot(c, float3(-0.0181508, -0.1005789,  1.1187297))
+    );
+}
+float3 AddBt709To2020(float3 c) {
+    return float3(
+        dot(c, float3(0.6274040, 0.3292830, 0.0433130)),
+        dot(c, float3(0.0690970, 0.9195400, 0.0113620)),
+        dot(c, float3(0.0163914, 0.0880133, 0.8955950))
+    );
+}
+float3 AddApplyDelta(float3 o, float3 pre, float3 col) {
+    o = AddCleanRgb(o);
+    pre = AddCleanRgb(pre);
+    col = AddCleanRgb(col);
+    int hdrMode = (gC[4].w > 0.5) ? (int)(gC[0].w + 0.5) : 0;
+    if (hdrMode == 1) {
+        o = clamp(o, -65504.0, 65504.0);
+        float3 oPos = max(o, 0.0);
+        float3 prePos = max(pre, 0.0);
+        float3 colPos = max(col, 0.0);
+        float3 dAdd = prePos - colPos;
+        float3 dRat = oPos * clamp(prePos / max(colPos, 1e-4) - 1.0, -0.5, 1.0);
+        float  trust = smoothstep(0.05, 0.25, min(dot(oPos, float3(0.2126, 0.7152, 0.0722)),
+                                                  dot(colPos, float3(0.2126, 0.7152, 0.0722))));
+        float3 e = lerp(dAdd, dRat, trust);
+        return clamp(o + e, min(o, 0.0), 65504.0);
+    }
+    if (hdrMode == 2) {
+        float3 oLin = max(AddBt2020To709(AddPQToLin(o)), 0.0);
+        float3 pLin = max(AddBt2020To709(AddPQToLin(pre)), 0.0);
+        float3 cLin = max(AddBt2020To709(AddPQToLin(col)), 0.0);
+        float3 dAdd = pLin - cLin;
+        float3 dRat = oLin * clamp(pLin / max(cLin, 1e-5) - 1.0, -0.5, 1.0);
+        float  trust = smoothstep(0.002, 0.02, min(dot(oLin, float3(0.2126, 0.7152, 0.0722)),
+                                                   dot(cLin, float3(0.2126, 0.7152, 0.0722))));
+        float3 res = max(oLin + lerp(dAdd, dRat, trust), 0.0);
+        return saturate(AddLinToPQ(max(AddBt709To2020(res), 0.0)));
+    }
+    return saturate(o + (pre - col));
+}
 
 // 当前使用：双线性抬升（最便宜，实测 +0.45ms）
 [numthreads(8,8,1)]
@@ -6416,7 +7056,7 @@ void Add4K(uint3 id : SV_DispatchThreadID)
     float4 o   = gSrc.Load(int3((int)id.x, (int)id.y, 0));
     float3 pre = gRes.SampleLevel(gSmp, uv, 0).rgb;
     float3 col = gMV.SampleLevel(gSmp, uv, 0).rgb;
-    gDst[id.xy] = float4(saturate(o.rgb + (pre - col)), o.a);
+    gDst[id.xy] = float4(AddApplyDelta(o.rgb, pre, col), o.a);
 }
 
 // 备选：引导式 JBU（边缘更稳，但 8 次散读，实测 +4ms / -12fps）
@@ -6434,24 +7074,27 @@ void Add4K_JBU(uint3 id : SV_DispatchThreadID)
     float2 wt = lc - fl;
     int2   i0 = int2(fl);
     int2   imax = int2((int)lw - 1, (int)lh - 1);
-    float3 esum = float3(0,0,0);
+    float3 preSum = float3(0,0,0), colSum = float3(0,0,0);
     float  wsum = 0.0;
     [unroll] for (int j = 0; j < 2; ++j) {
         [unroll] for (int i = 0; i < 2; ++i) {
             int2 q = clamp(i0 + int2(i, j), int2(0,0), imax);
             float4 pr = gRes.Load(int3(q, 0));
             float4 co = gMV.Load(int3(q, 0));
-            float3 e  = pr.rgb - co.rgb;
             float  ws = ((i == 0) ? (1.0 - wt.x) : wt.x) * ((j == 0) ? (1.0 - wt.y) : wt.y);
             float  cd = dot(abs(o.rgb - co.rgb), float3(0.3333, 0.3333, 0.3333));
             float  wc = saturate(1.0 - cd * 8.0);
             wc = wc * wc;
-            esum += e * (ws * wc);
+            preSum += pr.rgb * (ws * wc);
+            colSum += co.rgb * (ws * wc);
             wsum += ws * wc;
         }
     }
-    float3 e4 = (wsum > 1e-4) ? (esum / wsum) : float3(0,0,0);
-    gDst[id.xy] = float4(saturate(o.rgb + e4), o.a);
+    if (wsum > 1e-4) {
+        gDst[id.xy] = float4(AddApplyDelta(o.rgb, preSum / wsum, colSum / wsum), o.a);
+    } else {
+        gDst[id.xy] = o;
+    }
 }
 )HLSL";
 
@@ -6664,10 +7307,10 @@ static bool BuildResources(ID3D12Device* dev, ID3D12Resource* color,
     if (FAILED(dev->CreateRootSignature(0, sig->GetBufferPointer(), sig->GetBufferSize(), IID_PPV_ARGS(g_rs.GetAddressOf())))) return false;
 
     struct { const char* n; ID3D12PipelineState** p; } ps[] = {
-        { "DownCS", &g_psoDown }, { "ResidCS", &g_psoResid }, { "MarkCS", &g_psoMark }
-        , { "TriCS", &g_psoTri }
+        { "DownCS", &g_psoDown }, { "ResidCS", &g_psoResid }, { "MarkCS", &g_psoMark },
+        { "TriCS", &g_psoTri }, { "ScaleCS", &g_psoScale }
     };
-    std::string fullHlsl = std::string(kPreprocessHLSL) + kHLSL;
+    std::string fullHlsl = std::string(kPreprocessHLSL) + kHLSL + kHLSLResid;
     for (auto& e : ps) {
         ComPtr<ID3DBlob> cs, er;
         if (FAILED(D3DCompile(fullHlsl.data(), fullHlsl.size(), "v9.hlsl", nullptr, nullptr, e.n, "cs_5_0",
@@ -7837,12 +8480,19 @@ static UINT C4BbSrcSlot(int ai) {
 static void C4EnsureBbSrv(ID3D12Resource* tex, int ai) {
     if (!tex || !g_dev || !g_heap) return;
     if (ai < 0 || ai >= 3) return;
-    if (g_bbLastTex[ai] == tex && g_bbLastHeap[ai] == g_heap.Get()) return;
+    static DXGI_FORMAT s_bbLastFmt[3] = { DXGI_FORMAT_UNKNOWN, DXGI_FORMAT_UNKNOWN, DXGI_FORMAT_UNKNOWN };
+    D3D12_RESOURCE_DESC d = tex->GetDesc();
+    DXGI_FORMAT srvFmt = d.Format;
+    if (srvFmt == DXGI_FORMAT_R16G16B16A16_TYPELESS) srvFmt = DXGI_FORMAT_R16G16B16A16_FLOAT;
+    else if (srvFmt == DXGI_FORMAT_R10G10B10A2_TYPELESS) srvFmt = DXGI_FORMAT_R10G10B10A2_UNORM;
+    else if (srvFmt == DXGI_FORMAT_R8G8B8A8_TYPELESS) srvFmt = DXGI_FORMAT_R8G8B8A8_UNORM;
+    else if (srvFmt == DXGI_FORMAT_B8G8R8A8_TYPELESS) srvFmt = DXGI_FORMAT_B8G8R8A8_UNORM;
+    if (g_bbLastTex[ai] == tex && g_bbLastHeap[ai] == g_heap.Get() && s_bbLastFmt[ai] == srvFmt) return;
     g_bbLastTex[ai] = tex;
     g_bbLastHeap[ai] = g_heap.Get();
-    D3D12_RESOURCE_DESC d = tex->GetDesc();
+    s_bbLastFmt[ai] = srvFmt;
     D3D12_SHADER_RESOURCE_VIEW_DESC sd{};
-    sd.Format = d.Format;
+    sd.Format = srvFmt;
     sd.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
     sd.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
     sd.Texture2D.MipLevels = 1;
@@ -8008,25 +8658,32 @@ static void C4KickLocked(ID3D12CommandQueue* q) {
     }
     if (ai < 0) { C4DiagEarly(3, "busy_fence"); return; }         // 三套都还没跑完才跳过（不推进索引）
     g_bbAi = (ai + 1) % 3;                                        // 闸门放行才推进（本帧占用该套；后续若早退，本帧无提交，推进无害）
-    // 2026-11-14 c4outp3：确保 g_outp8[ai] 就绪（B8G8R8A8 + UAV，懒建；三缓冲与 allocator 对齐）
-    if (!g_outp8Ready[ai]) {
-        D3D12_HEAP_PROPERTIES hp{}; hp.Type = D3D12_HEAP_TYPE_DEFAULT;
-        D3D12_RESOURCE_DESC td{};
-        td.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
-        td.Width = g_outW; td.Height = g_outH;
-        td.DepthOrArraySize = 1; td.MipLevels = 1;
-        td.Format = DXGI_FORMAT_B8G8R8A8_UNORM; td.SampleDesc.Count = 1;
-        td.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
-        if (SUCCEEDED(g_dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &td,
-                D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&g_outp8[ai]))) && g_outp8[ai]) {
-            D3D12_UNORDERED_ACCESS_VIEW_DESC ud{};
-            ud.Format = DXGI_FORMAT_B8G8R8A8_UNORM; ud.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
-            D3D12_CPU_DESCRIPTOR_HANDLE h = g_heap->GetCPUDescriptorHandleForHeapStart();
-            const UINT uavSlot = (ai == 0) ? kSrvOutp8 : (ai == 1) ? kSrvOutp8b : kSrvOutp8c;
-            h.ptr += (SIZE_T)uavSlot * g_inc;
-            g_dev->CreateUnorderedAccessView(g_outp8[ai].Get(), nullptr, &ud, h);
-            g_outp8Ready[ai] = true;
-            Log("C4-S3: g_outp8[%d] 就绪 %ux%u（c4outp3 三缓冲）", ai, g_outW, g_outH);
+    // 2026-11-14 c4outp3：确保 g_outp8[ai] 就绪（按当前 HDR 模式匹配格式 + UAV，懒建；三缓冲与 allocator 对齐）
+    {
+        const DXGI_FORMAT outp8Fmt = (g_bHdrMode != 0) ? DXGI_FORMAT_R10G10B10A2_UNORM : DXGI_FORMAT_B8G8R8A8_UNORM;
+        if (g_outp8Ready[ai] && (!g_outp8[ai] || g_outp8[ai]->GetDesc().Format != outp8Fmt)) {
+            g_outp8Ready[ai] = false;
+            g_outp8[ai].Reset();
+        }
+        if (!g_outp8Ready[ai]) {
+            D3D12_HEAP_PROPERTIES hp{}; hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+            D3D12_RESOURCE_DESC td{};
+            td.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+            td.Width = g_outW; td.Height = g_outH;
+            td.DepthOrArraySize = 1; td.MipLevels = 1;
+            td.Format = outp8Fmt; td.SampleDesc.Count = 1;
+            td.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+            if (SUCCEEDED(g_dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &td,
+                    D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&g_outp8[ai]))) && g_outp8[ai]) {
+                D3D12_UNORDERED_ACCESS_VIEW_DESC ud{};
+                ud.Format = outp8Fmt; ud.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+                D3D12_CPU_DESCRIPTOR_HANDLE h = g_heap->GetCPUDescriptorHandleForHeapStart();
+                const UINT uavSlot = (ai == 0) ? kSrvOutp8 : (ai == 1) ? kSrvOutp8b : kSrvOutp8c;
+                h.ptr += (SIZE_T)uavSlot * g_inc;
+                g_dev->CreateUnorderedAccessView(g_outp8[ai].Get(), nullptr, &ud, h);
+                g_outp8Ready[ai] = true;
+                Log("C4-S3: g_outp8[%d] 就绪 %ux%u fmt=%d（c4outp3 三缓冲）", ai, g_outW, g_outH, (int)outp8Fmt);
+            }
         }
     }
     if (!g_outp8Ready[ai] || !g_outp8[ai]) { C4DiagEarly(4, "outp8_not_ready"); return; }
@@ -9117,9 +9774,26 @@ extern "C" int ProxyExecute(void* ctx, void* cmdList, const void* params, float 
             static bool qhTried = false;
             if (!qhTried && g_worker.q) { qhTried = true; InstallQueueHook(); }
         }
-        // B 形态懒初始化：必须等 g_worker.dev 建好之后再建跨卡 buffer
-        if (g_bformOn && !g_bformReady && color && mvRes && depRes)
+        if (g_bformOn && g_bformReady && BformResolveInputHdrMode() != g_bHdrMode) {
+            const int wantHdr = BformResolveInputHdrMode();
+            Log("BFORM-HDR: 检测到 HDR 模式变更 %d -> %d，重置并按新格式重建", (int)g_bHdrMode, wantHdr);
+            BformPresentShow(false);
+            if (g_bbFe) {
+                UINT64 maxUsed = 0;
+                for (int bi = 0; bi < 3; ++bi) if (g_bbFvUsed[bi] > maxUsed) maxUsed = g_bbFvUsed[bi];
+                if (maxUsed > 0 && g_bbFe->GetCompletedValue() < maxUsed) {
+                    g_bbFe->SetEventOnCompletion(maxUsed, nullptr);
+                    Sleep(16);
+                }
+            }
+            R28BumpEpoch("bHdrSwitch");
+            g_bformReady = false;
+            for (int bi = 0; bi < 3; ++bi) { g_outp8Ready[bi] = false; g_outp8[bi].Reset(); }
+            g_bHdrRebuildGen.fetch_add(1, std::memory_order_release);
+            { std::lock_guard<std::mutex> lk(g_worker.m); g_worker.cv.notify_one(); }
+        } else if (g_bformOn && !g_bformReady && color && mvRes && depRes) {
             BformInit(g_dev.Get(), color, mvRes, depRes);
+        }
         // ★ 看门狗：stage7 若让 worker 卡死，游戏会一直挂着。超过 3 秒没心跳就自动降回 stage 6
         //   （降级后 A 会继续出画、只是没有 NR；不会让游戏永久卡死）
         if (g_bformStage >= 7 && g_workerBeat) {
@@ -9567,6 +10241,13 @@ extern "C" int ProxyExecute(void* ctx, void* cmdList, const void* params, float 
                 // ★ B 形态下菜单要能被看见：B 显示的就是这张 4K 底图，
                 //   所以把 ImGui 画进 pOutput 再转换 → 菜单自然跟着底图跨卡上屏。
                 //   （原来菜单只画在 A 的输出上，被 B 的覆盖层盖住 → B 形态看不见菜单）
+                if (adapterDesc && outp) {
+                    g_a3LastColorFmt.store((UINT)outp->GetDesc().Format, std::memory_order_relaxed);
+                    g_a3LastIsHdrFlag.store(adapterDesc->isHdr, std::memory_order_relaxed);
+                    g_a3LastAutoExp.store(adapterDesc->autoExposure, std::memory_order_relaxed);
+                    g_a3LastPreExp.store((adapterDesc->preExposure > 1e-4f) ? adapterDesc->preExposure : 1.0f, std::memory_order_relaxed);
+                    g_a3LastHdrMode.store(A3::A3ResolveHdrMode(*adapterDesc, outp->GetDesc()), std::memory_order_relaxed);
+                }
                 ProxyImGuiDraw(cl, outp, false, outState);
                     const int par8 = (int)(g_frame & 1);   // 双缓冲：本帧写哪一份
                     XferEnsure();   // ★ 必须先建好围栏：否则钩子不 Signal → 拷永远不触发（逻辑死锁）
@@ -9576,24 +10257,32 @@ extern "C" int ProxyExecute(void* ctx, void* cmdList, const void* params, float 
                         DumpFlush(0);
                     }
                 // C4 有自己的三套分配；只有旧转换或 base=1 抓图需要按奇偶预建。
-                if ((!g_c4On || g_baseFromPresent == 1) && !g_outp8Ready[par8]) {
-                    D3D12_HEAP_PROPERTIES hp8{}; hp8.Type = D3D12_HEAP_TYPE_DEFAULT;
-                    D3D12_RESOURCE_DESC td8{};
-                    td8.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
-                    td8.Width = g_outW; td8.Height = g_outH;
-                    td8.DepthOrArraySize = 1; td8.MipLevels = 1;
-                    td8.Format = DXGI_FORMAT_B8G8R8A8_UNORM; td8.SampleDesc.Count = 1;
-                    td8.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
-                    if (SUCCEEDED(g_dev->CreateCommittedResource(&hp8, D3D12_HEAP_FLAG_NONE, &td8,
-                            D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&g_outp8[par8]))) && g_outp8[par8]) {
-                        D3D12_UNORDERED_ACCESS_VIEW_DESC ud8{};
-                        ud8.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
-                        ud8.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
-                        D3D12_CPU_DESCRIPTOR_HANDLE h8 = g_heap->GetCPUDescriptorHandleForHeapStart();
-                        h8.ptr += (SIZE_T)(par8 ? kSrvOutp8b : kSrvOutp8) * g_inc;   // ★ 两张缓冲各用自己的 UAV
-                        g_dev->CreateUnorderedAccessView(g_outp8[par8].Get(), nullptr, &ud8, h8);
-                        g_outp8Ready[par8] = true;
-                        Log("BFORM: 4K 后置转换目标就绪 %ux%u（8bit）", g_outW, g_outH);
+                {
+                    const DXGI_FORMAT outp8Fmt = (g_bHdrMode != 0) ? DXGI_FORMAT_R10G10B10A2_UNORM : DXGI_FORMAT_B8G8R8A8_UNORM;
+                    if ((!g_c4On || g_baseFromPresent == 1) && g_outp8Ready[par8] &&
+                        (!g_outp8[par8] || g_outp8[par8]->GetDesc().Format != outp8Fmt)) {
+                        g_outp8Ready[par8] = false;
+                        g_outp8[par8].Reset();
+                    }
+                    if ((!g_c4On || g_baseFromPresent == 1) && !g_outp8Ready[par8]) {
+                        D3D12_HEAP_PROPERTIES hp8{}; hp8.Type = D3D12_HEAP_TYPE_DEFAULT;
+                        D3D12_RESOURCE_DESC td8{};
+                        td8.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+                        td8.Width = g_outW; td8.Height = g_outH;
+                        td8.DepthOrArraySize = 1; td8.MipLevels = 1;
+                        td8.Format = outp8Fmt; td8.SampleDesc.Count = 1;
+                        td8.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+                        if (SUCCEEDED(g_dev->CreateCommittedResource(&hp8, D3D12_HEAP_FLAG_NONE, &td8,
+                                D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&g_outp8[par8]))) && g_outp8[par8]) {
+                            D3D12_UNORDERED_ACCESS_VIEW_DESC ud8{};
+                            ud8.Format = outp8Fmt;
+                            ud8.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+                            D3D12_CPU_DESCRIPTOR_HANDLE h8 = g_heap->GetCPUDescriptorHandleForHeapStart();
+                            h8.ptr += (SIZE_T)(par8 ? kSrvOutp8b : kSrvOutp8) * g_inc;   // ★ 两张缓冲各用自己的 UAV
+                            g_dev->CreateUnorderedAccessView(g_outp8[par8].Get(), nullptr, &ud8, h8);
+                            g_outp8Ready[par8] = true;
+                            Log("BFORM: 4K 后置转换目标就绪 %ux%u fmt=%d", g_outW, g_outH, (int)outp8Fmt);
+                        }
                     }
                 }
                 // ★ 直接拷 pOutput（原生 10bit）：-- 实验失败，已回退（见下）
@@ -10238,6 +10927,11 @@ extern "C" int ProxyExecute(void* ctx, void* cmdList, const void* params, float 
     //   为什么能同帧：XeSS 是我们自己在这个命令列表里调用的（⑥），所以拷贝可以排在它后面。
     //   若改成"下一帧再从 pOutput 取"，就会白晚一帧。
     if (!g_c4On && !did4kUpscale && g_bform4k && g_bformOn && g_bformStage >= 6 && g_outpRes && g_psoFmt8 && UiGateAllowsNr()) {
+        const DXGI_FORMAT outp8Fmt = (g_bHdrMode != 0) ? DXGI_FORMAT_R10G10B10A2_UNORM : DXGI_FORMAT_B8G8R8A8_UNORM;
+        if (g_outp8Ready[0] && (!g_outp8[0] || g_outp8[0]->GetDesc().Format != outp8Fmt)) {
+            g_outp8Ready[0] = false;
+            g_outp8[0].Reset();
+        }
         if (!g_outp8Ready[0]) {
             D3D12_HEAP_PROPERTIES hp{};
             hp.Type = D3D12_HEAP_TYPE_DEFAULT;
@@ -10245,18 +10939,18 @@ extern "C" int ProxyExecute(void* ctx, void* cmdList, const void* params, float 
             td.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
             td.Width = g_outW; td.Height = g_outH;
             td.DepthOrArraySize = 1; td.MipLevels = 1;
-            td.Format = DXGI_FORMAT_B8G8R8A8_UNORM; td.SampleDesc.Count = 1;
+            td.Format = outp8Fmt; td.SampleDesc.Count = 1;
             td.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
             if (SUCCEEDED(g_dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &td,
                     D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&g_outp8[0]))) && g_outp8[0]) {
                 D3D12_UNORDERED_ACCESS_VIEW_DESC ud{};
-                ud.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+                ud.Format = outp8Fmt;
                 ud.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
                 D3D12_CPU_DESCRIPTOR_HANDLE h = g_heap->GetCPUDescriptorHandleForHeapStart();
                 h.ptr += (SIZE_T)kSrvOutp8 * g_inc;
                 g_dev->CreateUnorderedAccessView(g_outp8[0].Get(), nullptr, &ud, h);
                 g_outp8Ready[0] = true;
-                Log("BFORM: 4K 后置转换目标就绪 %ux%u（8bit）", g_outW, g_outH);
+                Log("BFORM: 4K 后置转换目标就绪 %ux%u fmt=%d", g_outW, g_outH, (int)outp8Fmt);
             }
         }
         if (g_outp8Ready[0]) {
@@ -10313,6 +11007,11 @@ extern "C" int ProxyExecute(void* ctx, void* cmdList, const void* params, float 
 // ---------------- ImGui 覆盖层（Del 唤出，键盘导航） ----------------
 static ComPtr<ID3D12DescriptorHeap> g_imguiSrvHeap;
 static ComPtr<ID3D12DescriptorHeap> g_imguiRtvHeap;
+static ComPtr<ID3D12Resource>       g_imguiTex;
+static UINT                         g_imguiTexW = 0, g_imguiTexH = 0;
+static ComPtr<ID3D12RootSignature>  g_imguiComposeRs;
+static ComPtr<ID3D12PipelineState>  g_imguiComposePso;
+static DXGI_FORMAT                  g_imguiComposeFmt = DXGI_FORMAT_UNKNOWN;
 static bool g_imguiInited = false, g_imguiFail = false;
 static WNDPROC g_origWndProc = nullptr;
 
@@ -10394,12 +11093,15 @@ static bool PatchIatOne(HMODULE mod, const char* dllName, const char* fnName, vo
 
 // ================= 进程内 Present 钩子（取最终画面：tonemap + UI 之后）=================
 //   复用本文件已有的 PatchIatOne：IAT 钩住 dxgi 的建交换链函数 → 拿到交换链 → 钩 vtable Present
-static const int SLOT_Present = 8, SLOT_Present1 = 22;
+static const int SLOT_Present = 8, SLOT_Present1 = 22, SLOT_SetColorSpace1 = 38;
 static void** g_pSCOrig = nullptr;      // 原 Present 表
 static void** g_pSCNew  = nullptr;      // 我们的表
 static std::vector<IDXGISwapChain*> g_scList;   // 已钩到的交换链（防重复）
 static ID3D12CommandAllocator*   g_presAl = nullptr;
 static ID3D12GraphicsCommandList* g_presCl = nullptr;
+static HRESULT STDMETHODCALLTYPE Detour_Present(IDXGISwapChain* self, UINT sync, UINT flags);
+static HRESULT STDMETHODCALLTYPE Detour_Present1(IDXGISwapChain1* self, UINT sync, UINT flags, const DXGI_PRESENT_PARAMETERS* pp);
+static HRESULT STDMETHODCALLTYPE Detour_SetColorSpace1(IDXGISwapChain3* self, DXGI_COLOR_SPACE_TYPE cs);
 
 // ===== 向同进程的 dxgi.dll（我们的 present_grab）索取"最终画面" =====
 //   成功返回 ID3D12Resource*（已 AddRef，调用方负责 Release），失败返回 nullptr
@@ -10469,14 +11171,14 @@ static void InstallVtablePresentHook() {
 
     void** vt = *(void***)sc1.Get();
     if (!g_pSCOrig) {
-        g_pSCOrig = (void**)malloc(sizeof(void*) * 32);
-        memcpy(g_pSCOrig, vt, sizeof(void*) * 32);
+        g_pSCOrig = (void**)malloc(sizeof(void*) * 44);
+        memcpy(g_pSCOrig, vt, sizeof(void*) * 44);
     }
-    // ★ 收窄补丁：只碰 Present(8)；Present1(22) 仅在确认对象是 IDXGISwapChain1 时才写
-    //   上次崩溃最可能就是写了 32 个槽 / 越界写到相邻函数指针
     ComPtr<IDXGISwapChain1> probe;
     const bool hasV1 = SUCCEEDED(sc1->QueryInterface(IID_PPV_ARGS(&probe))) && probe;
-    bool okP = false, okP1 = false;
+    ComPtr<IDXGISwapChain3> probe3;
+    const bool hasV3 = SUCCEEDED(sc1->QueryInterface(IID_PPV_ARGS(&probe3))) && probe3;
+    bool okP = false, okP1 = false, okCs = false;
     DWORD old = 0;
     if (VirtualProtect(&vt[SLOT_Present], sizeof(void*), PAGE_READWRITE, &old)) {
         vt[SLOT_Present] = (void*)&Detour_Present;
@@ -10486,8 +11188,12 @@ static void InstallVtablePresentHook() {
         vt[SLOT_Present1] = (void*)&Detour_Present1;
         okP1 = true;
     }
-    Log("vtable 钩子: Present=%d Present1=%d (IDXGISwapChain1=%d) 原表=%p",
-        (int)okP, (int)okP1, (int)hasV1, (void*)g_pSCOrig);
+    if (hasV3 && VirtualProtect(&vt[SLOT_SetColorSpace1], sizeof(void*), PAGE_READWRITE, &old)) {
+        vt[SLOT_SetColorSpace1] = (void*)&Detour_SetColorSpace1;
+        okCs = true;
+    }
+    Log("vtable 钩子: Present=%d Present1=%d SetCS=%d (V1=%d V3=%d) 原表=%p",
+        (int)okP, (int)okP1, (int)okCs, (int)hasV1, (int)hasV3, (void*)g_pSCOrig);
 }
 
 // ★ 线程安全改造：Present 线程只登记"要抓哪条交换链 + 帧号"，
@@ -10555,8 +11261,29 @@ static void DoPendingGrab() {
     g_imgFrame[slot] = g_frameNow;
 }
 
-static HRESULT STDMETHODCALLTYPE Detour_Present(IDXGISwapChain* self, UINT sync, UINT flags);
-static HRESULT STDMETHODCALLTYPE Detour_Present1(IDXGISwapChain1* self, UINT sync, UINT flags, const DXGI_PRESENT_PARAMETERS* pp);
+static void ProbeSwapChainHdr(IDXGISwapChain* sc) {
+    if (!sc) return;
+    static ULONGLONG lastTick = 0;
+    const ULONGLONG now = GetTickCount64();
+    if (g_scBbFmt.load(std::memory_order_relaxed) != 0 && (now - lastTick) < 1500) return;
+    lastTick = now;
+    ComPtr<IDXGISwapChain3> sc3;
+    if (SUCCEEDED(sc->QueryInterface(IID_PPV_ARGS(&sc3))) && sc3) {
+        DXGI_SWAP_CHAIN_DESC1 sd1{};
+        if (SUCCEEDED(sc3->GetDesc1(&sd1))) {
+            UINT outHdr = 0;
+            ComPtr<IDXGIOutput> out;
+            ComPtr<IDXGIOutput6> out6;
+            DXGI_OUTPUT_DESC1 od1{};
+            if (SUCCEEDED(sc->GetContainingOutput(&out)) && out &&
+                SUCCEEDED(out.As(&out6)) && out6 && SUCCEEDED(out6->GetDesc1(&od1)) &&
+                od1.ColorSpace == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020) {
+                outHdr = 1u;
+            }
+            AmdNrSetSwapChainHdrInfo((unsigned int)sd1.Format, -1, outHdr);
+        }
+    }
+}
 
 static void HookOneSwapChain(IDXGISwapChain* sc) {
     if (!sc || !g_dev) return;
@@ -10565,12 +11292,17 @@ static void HookOneSwapChain(IDXGISwapChain* sc) {
         IDXGISwapChain1* sc1 = nullptr;
         if (SUCCEEDED(sc->QueryInterface(IID_PPV_ARGS(&sc1))) && sc1) {
             void** vtbl = *(void***)sc1;
-            g_pSCOrig = (void**)malloc(sizeof(void*) * 32);
-            memcpy(g_pSCOrig, vtbl, sizeof(void*) * 32);
-            g_pSCNew = (void**)malloc(sizeof(void*) * 32);
-            memcpy(g_pSCNew, g_pSCOrig, sizeof(void*) * 32);
+            g_pSCOrig = (void**)malloc(sizeof(void*) * 44);
+            memcpy(g_pSCOrig, vtbl, sizeof(void*) * 44);
+            g_pSCNew = (void**)malloc(sizeof(void*) * 44);
+            memcpy(g_pSCNew, g_pSCOrig, sizeof(void*) * 44);
             g_pSCNew[SLOT_Present]  = (void*)&Detour_Present;
             g_pSCNew[SLOT_Present1] = (void*)&Detour_Present1;
+            IDXGISwapChain3* sc3 = nullptr;
+            if (SUCCEEDED(sc->QueryInterface(IID_PPV_ARGS(&sc3))) && sc3) {
+                g_pSCNew[SLOT_SetColorSpace1] = (void*)&Detour_SetColorSpace1;
+                sc3->Release();
+            }
             sc1->Release();
         }
     }
@@ -10580,7 +11312,14 @@ static void HookOneSwapChain(IDXGISwapChain* sc) {
     Log("Present 钩子: 已挂到交换链 %p（共 %d 条）", (void*)sc, (int)g_scList.size());
 }
 
+static HRESULT STDMETHODCALLTYPE Detour_SetColorSpace1(IDXGISwapChain3* self, DXGI_COLOR_SPACE_TYPE cs) {
+    g_scColorSpace.store((int)cs, std::memory_order_relaxed);
+    using Fn = HRESULT(STDMETHODCALLTYPE*)(IDXGISwapChain3*, DXGI_COLOR_SPACE_TYPE);
+    return ((Fn)g_pSCOrig[SLOT_SetColorSpace1])(self, cs);
+}
+
 static HRESULT STDMETHODCALLTYPE Detour_Present(IDXGISwapChain* self, UINT sync, UINT flags) {
+    ProbeSwapChainHdr(self);
     __try {
         ID3D12Resource* t = nullptr;   // 裸指针：__try 里不能有带析构的局部对象
         if (self && SUCCEEDED(self->GetBuffer(0, IID_PPV_ARGS(&t))) && t) { t->Release(); GrabBackbuffer(self); }
@@ -10595,6 +11334,7 @@ static HRESULT STDMETHODCALLTYPE Detour_Present(IDXGISwapChain* self, UINT sync,
     return hrPres;
 }
 static HRESULT STDMETHODCALLTYPE Detour_Present1(IDXGISwapChain1* self, UINT sync, UINT flags, const DXGI_PRESENT_PARAMETERS* pp) {
+    ProbeSwapChainHdr(self);
     __try {
         ID3D12Resource* t = nullptr;
         if (self && SUCCEEDED(self->GetBuffer(0, IID_PPV_ARGS(&t))) && t) { t->Release(); GrabBackbuffer(self); }
@@ -10744,6 +11484,244 @@ static LRESULT CALLBACK ProxyWndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
 }
 static bool g_menuVisible = false;
 
+static const char* kImguiComposeHlsl = R"HLSL(
+cbuffer ComposeCB : register(b0) { uint mode; float scale; float pad0; float pad1; };
+Texture2D<float4> menu : register(t0);
+
+struct VSOut { float4 pos : SV_Position; };
+VSOut vs(uint id : SV_VertexID) {
+    VSOut o;
+    float2 p = float2((id & 1u) ? 3.0 : -1.0, (id & 2u) ? -3.0 : 1.0);
+    o.pos = float4(p, 0.0, 1.0);
+    return o;
+}
+float3 srgb_to_linear(float3 c) {
+    float3 a = c / 12.92;
+    float3 b = pow(max((c + 0.055) / 1.055, 1e-6), 2.4);
+    return lerp(a, b, step(0.04045, c));
+}
+float3 pq(float3 n) {
+    const float m1 = 0.1593017578125, m2 = 78.84375, c1 = 0.8359375, c2 = 18.8515625, c3 = 18.6875;
+    float3 x = max(n, 0.0);
+    float3 p = pow(max(x, 1e-7), m1);
+    float3 r = pow(max((c1 + c2 * p) / max(1.0 + c3 * p, 1e-6), 1e-7), m2);
+    return lerp(float3(0.0, 0.0, 0.0), saturate(r), step(1e-7, x));
+}
+float4 ps(float4 pos : SV_Position) : SV_Target {
+    float4 m = menu.Load(int3(int2(pos.xy), 0));
+    if (m.a <= 0.0) discard;
+    float3 c = saturate(m.rgb / m.a);
+    if (mode == 1u) {
+        c = srgb_to_linear(c);
+    } else if (mode == 2u) {
+        c = srgb_to_linear(c) * scale;
+    } else if (mode == 3u) {
+        float3 l = srgb_to_linear(c);
+        float3 w = float3(dot(float3(0.627404, 0.329283, 0.043313), l),
+                          dot(float3(0.069097, 0.919540, 0.011362), l),
+                          dot(float3(0.016391, 0.088013, 0.895595), l));
+        c = pq(w * scale);
+    }
+    return float4(c * m.a, m.a);
+}
+)HLSL";
+
+static DXGI_FORMAT ImGuiUnwrapRtvFmt(DXGI_FORMAT fmt) {
+    switch (fmt) {
+    case DXGI_FORMAT_R16G16B16A16_TYPELESS: return DXGI_FORMAT_R16G16B16A16_FLOAT;
+    case DXGI_FORMAT_R10G10B10A2_TYPELESS:  return DXGI_FORMAT_R10G10B10A2_UNORM;
+    case DXGI_FORMAT_R8G8B8A8_TYPELESS:     return DXGI_FORMAT_R8G8B8A8_UNORM;
+    case DXGI_FORMAT_B8G8R8A8_TYPELESS:     return DXGI_FORMAT_B8G8R8A8_UNORM;
+    default: return fmt;
+    }
+}
+
+static bool EnsureImguiOffscreenTarget(UINT w, UINT h) {
+    if (!g_dev || w == 0 || h == 0) return false;
+    if (g_imguiTex && g_imguiTexW == w && g_imguiTexH == h) return true;
+    g_imguiTex.Reset();
+    D3D12_HEAP_PROPERTIES hp{}; hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+    hp.CreationNodeMask = hp.VisibleNodeMask = 1;
+    D3D12_RESOURCE_DESC rd{};
+    rd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    rd.Width = w; rd.Height = h; rd.DepthOrArraySize = 1; rd.MipLevels = 1;
+    rd.Format = DXGI_FORMAT_R8G8B8A8_UNORM; rd.SampleDesc.Count = 1;
+    rd.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+    D3D12_CLEAR_VALUE cv{}; cv.Format = rd.Format;
+    if (FAILED(g_dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd,
+            D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, &cv, IID_PPV_ARGS(g_imguiTex.GetAddressOf())))) {
+        return false;
+    }
+    g_imguiTexW = w; g_imguiTexH = h;
+    D3D12_RENDER_TARGET_VIEW_DESC rtvd{};
+    rtvd.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    rtvd.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2D;
+    g_dev->CreateRenderTargetView(g_imguiTex.Get(), &rtvd, g_imguiRtvHeap->GetCPUDescriptorHandleForHeapStart());
+
+    UINT srvInc = g_inc ? g_inc : g_dev->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    D3D12_CPU_DESCRIPTOR_HANDLE srvCpu = g_imguiSrvHeap->GetCPUDescriptorHandleForHeapStart();
+    srvCpu.ptr += (SIZE_T)7 * srvInc;
+    D3D12_SHADER_RESOURCE_VIEW_DESC srvd{};
+    srvd.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    srvd.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+    srvd.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    srvd.Texture2D.MipLevels = 1;
+    g_dev->CreateShaderResourceView(g_imguiTex.Get(), &srvd, srvCpu);
+    return true;
+}
+
+static bool EnsureImguiComposePso(DXGI_FORMAT rtvFmt) {
+    if (!g_dev) return false;
+    if (!g_imguiComposeRs) {
+        D3D12_DESCRIPTOR_RANGE rng{};
+        rng.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+        rng.NumDescriptors = 1; rng.BaseShaderRegister = 0;
+        D3D12_ROOT_PARAMETER rp[2] = {};
+        rp[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+        rp[0].DescriptorTable.NumDescriptorRanges = 1;
+        rp[0].DescriptorTable.pDescriptorRanges = &rng;
+        rp[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+        rp[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+        rp[1].Constants.ShaderRegister = 0;
+        rp[1].Constants.Num32BitValues = 4;
+        rp[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+        D3D12_ROOT_SIGNATURE_DESC rsd{};
+        rsd.NumParameters = 2; rsd.pParameters = rp;
+        ComPtr<ID3DBlob> sig, err;
+        if (FAILED(D3D12SerializeRootSignature(&rsd, D3D_ROOT_SIGNATURE_VERSION_1, &sig, &err))) return false;
+        if (FAILED(g_dev->CreateRootSignature(0, sig->GetBufferPointer(), sig->GetBufferSize(),
+                IID_PPV_ARGS(g_imguiComposeRs.GetAddressOf())))) return false;
+    }
+    if (g_imguiComposePso && g_imguiComposeFmt == rtvFmt) return true;
+    g_imguiComposePso.Reset();
+    ComPtr<ID3DBlob> vs, ps, err;
+    if (FAILED(D3DCompile(kImguiComposeHlsl, strlen(kImguiComposeHlsl), "imgui_hdr_compose.hlsl", nullptr, nullptr,
+            "vs", "vs_5_0", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &vs, &err))) return false;
+    if (FAILED(D3DCompile(kImguiComposeHlsl, strlen(kImguiComposeHlsl), "imgui_hdr_compose.hlsl", nullptr, nullptr,
+            "ps", "ps_5_0", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &ps, &err))) return false;
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC pd{};
+    pd.pRootSignature = g_imguiComposeRs.Get();
+    pd.VS = { vs->GetBufferPointer(), vs->GetBufferSize() };
+    pd.PS = { ps->GetBufferPointer(), ps->GetBufferSize() };
+    pd.BlendState.RenderTarget[0].BlendEnable = TRUE;
+    pd.BlendState.RenderTarget[0].SrcBlend = D3D12_BLEND_ONE;
+    pd.BlendState.RenderTarget[0].DestBlend = D3D12_BLEND_INV_SRC_ALPHA;
+    pd.BlendState.RenderTarget[0].BlendOp = D3D12_BLEND_OP_ADD;
+    pd.BlendState.RenderTarget[0].SrcBlendAlpha = D3D12_BLEND_ONE;
+    pd.BlendState.RenderTarget[0].DestBlendAlpha = D3D12_BLEND_INV_SRC_ALPHA;
+    pd.BlendState.RenderTarget[0].BlendOpAlpha = D3D12_BLEND_OP_ADD;
+    pd.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+    pd.SampleMask = UINT_MAX;
+    pd.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+    pd.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+    pd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+    pd.NumRenderTargets = 1;
+    pd.RTVFormats[0] = rtvFmt;
+    pd.SampleDesc.Count = 1;
+    if (FAILED(g_dev->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(g_imguiComposePso.GetAddressOf())))) return false;
+    g_imguiComposeFmt = rtvFmt;
+    return true;
+}
+
+static void ImGuiComposeParams(DXGI_FORMAT rtvFmt, UINT& outMode, float& outScale) {
+    const UINT a3Hdr = g_a3LastHdrMode.load(std::memory_order_relaxed);
+    const float div = g_a3LastDivisor.load(std::memory_order_relaxed);
+    const float whiteNits = std::clamp(g_hdrPqWhiteNits, 80.0f, 1000.0f);
+    if (rtvFmt == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB || rtvFmt == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB) {
+        outMode = 1u; outScale = 1.0f;
+    } else if (a3Hdr == 2u) {
+        outMode = 3u; outScale = std::clamp(whiteNits / 10000.0f, 0.005f, 0.1f);
+    } else if (rtvFmt == DXGI_FORMAT_R16G16B16A16_FLOAT || rtvFmt == DXGI_FORMAT_R11G11B10_FLOAT ||
+               rtvFmt == DXGI_FORMAT_R32G32B32A32_FLOAT) {
+        outMode = 2u;
+        outScale = (a3Hdr == 1u) ? std::clamp(div * (whiteNits / 203.0f), 0.5f, 16.0f) : 1.0f;
+    } else {
+        outMode = 0u; outScale = 1.0f;
+    }
+}
+
+static void DrawImguiOffscreenAndComposite(ID3D12GraphicsCommandList* cl, ID3D12Resource* rt,
+                                           D3D12_RESOURCE_STATES outputState) {
+    const auto desc = rt->GetDesc();
+    const UINT w = (UINT)desc.Width, h = desc.Height;
+    const DXGI_FORMAT rtvFmt = ImGuiUnwrapRtvFmt(desc.Format);
+    if (!EnsureImguiOffscreenTarget(w, h) || !EnsureImguiComposePso(rtvFmt)) return;
+
+    UINT rtvInc = g_dev->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+    UINT srvInc = g_inc ? g_inc : g_dev->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    D3D12_CPU_DESCRIPTOR_HANDLE offRtv = g_imguiRtvHeap->GetCPUDescriptorHandleForHeapStart();
+    D3D12_CPU_DESCRIPTOR_HANDLE dstRtv = offRtv; dstRtv.ptr += rtvInc;
+    D3D12_GPU_DESCRIPTOR_HANDLE offSrv = g_imguiSrvHeap->GetGPUDescriptorHandleForHeapStart();
+    offSrv.ptr += (SIZE_T)7 * srvInc;
+
+    Barrier(cl, g_imguiTex.Get(), D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
+    const float clearColor[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+    cl->ClearRenderTargetView(offRtv, clearColor, 0, nullptr);
+    cl->OMSetRenderTargets(1, &offRtv, FALSE, nullptr);
+    D3D12_VIEWPORT vp{ 0, 0, (float)w, (float)h, 0, 1 };
+    D3D12_RECT sc{ 0, 0, (LONG)w, (LONG)h };
+    cl->RSSetViewports(1, &vp);
+    cl->RSSetScissorRects(1, &sc);
+    ID3D12DescriptorHeap* imguiHeaps[] = { g_imguiSrvHeap.Get() };
+    cl->SetDescriptorHeaps(1, imguiHeaps);
+    ImGui_ImplDX12_RenderDrawData(ImGui::GetDrawData(), cl);
+    Barrier(cl, g_imguiTex.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+
+    D3D12_RENDER_TARGET_VIEW_DESC dstRtvDesc{};
+    dstRtvDesc.Format = rtvFmt;
+    dstRtvDesc.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2D;
+    g_dev->CreateRenderTargetView(rt, &dstRtvDesc, dstRtv);
+
+    Barrier(cl, rt, outputState, D3D12_RESOURCE_STATE_RENDER_TARGET);
+    cl->OMSetRenderTargets(1, &dstRtv, FALSE, nullptr);
+    cl->RSSetViewports(1, &vp);
+    cl->RSSetScissorRects(1, &sc);
+    cl->SetDescriptorHeaps(1, imguiHeaps);
+    cl->SetGraphicsRootSignature(g_imguiComposeRs.Get());
+    cl->SetPipelineState(g_imguiComposePso.Get());
+    cl->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    cl->SetGraphicsRootDescriptorTable(0, offSrv);
+    struct { UINT mode; float scale; float pad0; float pad1; } cb{};
+    ImGuiComposeParams(rtvFmt, cb.mode, cb.scale);
+    cl->SetGraphicsRoot32BitConstants(1, 4, &cb, 0);
+    cl->DrawInstanced(3, 1, 0, 0);
+    Barrier(cl, rt, D3D12_RESOURCE_STATE_RENDER_TARGET, outputState);
+
+    ID3D12DescriptorHeap* hs[] = { g_heap.Get() };
+    cl->SetDescriptorHeaps(1, hs);
+}
+
+static void MenuSectionHdr() {
+    ImGui::TextDisabled("════ HDR 适配与曝光归一化（A & B 双形态均已打通）════");
+    const UINT hdrMode = g_a3LastHdrMode.load(std::memory_order_relaxed);
+    const char* modeName = (hdrMode == 1) ? "LinearHDR" : (hdrMode == 2 ? "PQ HDR10" : "SDR");
+    const int bIn = (int)g_bHdrMode;
+    const int bOut = g_bOutHdrMode.load(std::memory_order_relaxed);
+    const char* bInName = (bIn == 1) ? "scRGB" : (bIn == 2 ? "PQ-HDR10" : "SDR");
+    const char* bOutName = (bOut == 1) ? "scRGB-FP16" : (bOut == 2 ? "PQ-HDR10" : "SDR-8bit");
+    ImGui::Text("A 判定: %s | 格式=%u | IsHDR=%d | AutoExp=%d | ExpTex=%d | PreExp=%.2f | Div=%.2f",
+                modeName,
+                g_a3LastColorFmt.load(std::memory_order_relaxed),
+                (int)g_a3LastIsHdrFlag.load(std::memory_order_relaxed),
+                (int)g_a3LastAutoExp.load(std::memory_order_relaxed),
+                (int)g_a3LastHasExpTex.load(std::memory_order_relaxed),
+                g_a3LastPreExp.load(std::memory_order_relaxed),
+                g_a3LastDivisor.load(std::memory_order_relaxed));
+    ImGui::Text("B 状态: SwapChain fmt=%u cs=%d OutHDR=%u | 跨卡=%s | DComp输出=%s",
+                g_scBbFmt.load(std::memory_order_relaxed),
+                g_scColorSpace.load(std::memory_order_relaxed),
+                g_scOutputHdr.load(std::memory_order_relaxed),
+                bInName, bOutName);
+    ImGui::Combo("HDR 模式覆盖", &g_hdrOverride, "Auto (自动判定)\0强制 SDR\0强制 LinearHDR\0强制 PQ HDR10\0");
+    ImGui::Combo("HDR 压缩曲线", &g_hdrCurve, "Neutwo (推荐·全段平滑)\0SoftKnee (分段压缩)\0");
+    ImGui::Combo("HDR 曝光来源", &g_hdrExpSource, "自动融合 (游戏曝光 + 帧扫描)\0仅 8x8 帧扫描\0");
+    ImGui::SliderFloat("HDR 白点缩放倍率", &g_hdrWhiteScale, 0.25f, 4.0f, "%.2f");
+    ImGui::SliderFloat("PQ 参考白亮度 (nits)", &g_hdrPqWhiteNits, 80.0f, 1000.0f, "%.0f");
+    bool cc = g_hdrChromaClamp > 0.5f;
+    if (ImGui::Checkbox("HDR 高光峰谷收敛保护", &cc)) g_hdrChromaClamp = cc ? 1.0f : 0.0f;
+    ImGui::Separator();
+}
+
 static bool ProxyImGuiInit() {
     if (g_imguiInited || g_imguiFail) return g_imguiInited;
     if (!g_dev) { g_imguiFail = true; return false; }
@@ -10755,7 +11733,7 @@ static bool ProxyImGuiInit() {
         if (FAILED(g_dev->CreateDescriptorHeap(&sh, IID_PPV_ARGS(g_imguiSrvHeap.GetAddressOf())))) { g_imguiFail = true; return false; }
         D3D12_DESCRIPTOR_HEAP_DESC rh{};
         rh.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
-        rh.NumDescriptors = 1;
+        rh.NumDescriptors = 2;
         if (FAILED(g_dev->CreateDescriptorHeap(&rh, IID_PPV_ARGS(g_imguiRtvHeap.GetAddressOf())))) { g_imguiFail = true; return false; }
 
         IMGUI_CHECKVERSION();
@@ -10782,7 +11760,7 @@ static bool ProxyImGuiInit() {
         io.DisplaySize = ImVec2((float)g_outW, (float)g_outH);
         io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
 
-        if (!ImGui_ImplDX12_Init(g_dev.Get(), 4, DXGI_FORMAT_R10G10B10A2_UNORM, g_imguiSrvHeap.Get(),
+        if (!ImGui_ImplDX12_Init(g_dev.Get(), 4, DXGI_FORMAT_R8G8B8A8_UNORM, g_imguiSrvHeap.Get(),
                                  g_imguiSrvHeap->GetCPUDescriptorHandleForHeapStart(),
                                  g_imguiSrvHeap->GetGPUDescriptorHandleForHeapStart())) {
             g_imguiFail = true; Log("ImGui: 后端初始化失败（已禁用）"); return false;
@@ -10991,10 +11969,10 @@ static void MenuSectionRuntimeForm() {
     ImGui::SameLine();
     ImGui::TextDisabled("也可直接按 F3 热切换（约 1 秒生效）");
     bool diagOn = (g_diagLogOn != 0);
-    if (ImGui::Checkbox("启用诊断日志（排障时开启 · 上限 20MB）", &diagOn)) {
+    if (ImGui::Checkbox("启用诊断日志（默认开启 · 上限 30MB）", &diagOn)) {
         SetDiagLogEnabled(diagOn, true, "菜单一键开关");
     }
-    ImGui::SetItemTooltip("正常游玩默认关闭（零磁盘 I/O）。排障时一键开启，写 xess_proxy.log / 适配层 / NGX 日志并自动控制在 20MB 内；也可编辑 xess_proxy.log.txt (0/1) 或 xess_proxy.saved.ini (diag_log=0/1)");
+    ImGui::SetItemTooltip("默认开启，写 xess_proxy.log / 适配层 / NGX 日志并自动控制在 30MB 内；需要零写盘时可一键关闭，也可编辑 xess_proxy.log.txt (0/1) 或 xess_proxy.saved.ini (diag_log=0/1)");
     ImGui::SameLine();
     ImGui::TextDisabled(diagOn ? "日志: 开启中" : "日志: 已关闭（零写盘）");
     ImGui::Separator();
@@ -11006,7 +11984,10 @@ static void ProxyImGuiDraw(ID3D12GraphicsCommandList* cl, ID3D12Resource* rt, bo
     if (!g_menuVisible) { return; }
     __try {
         ImGuiIO& io = ImGui::GetIO();
-        io.DisplaySize = ImVec2((float)g_outW, (float)g_outH);
+        const auto rtDesc = rt->GetDesc();
+        const float dispW = (float)(rtDesc.Width ? rtDesc.Width : g_outW);
+        const float dispH = (float)(rtDesc.Height ? rtDesc.Height : g_outH);
+        io.DisplaySize = ImVec2(dispW, dispH);
         io.DeltaTime = 1.0f / 60.0f;
         auto key = [&](ImGuiKey k, int vk) { io.AddKeyEvent(k, (GetAsyncKeyState(vk) & 0x8000) != 0); };
         key(ImGuiKey_UpArrow, VK_UP);     key(ImGuiKey_DownArrow, VK_DOWN);
@@ -11021,7 +12002,7 @@ static void ProxyImGuiDraw(ID3D12GraphicsCommandList* cl, ID3D12Resource* rt, bo
             RECT rc{}; GetClientRect(g_gameHwnd, &rc);
             float cw = (float)(rc.right - rc.left), ch = (float)(rc.bottom - rc.top);
             if (cw > 0 && ch > 0)
-                io.AddMousePosEvent((float)p.x * (float)g_outW / cw, (float)p.y * (float)g_outH / ch);
+                io.AddMousePosEvent((float)p.x * dispW / cw, (float)p.y * dispH / ch);
         }
         io.AddMouseButtonEvent(0, (GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0);
         io.AddMouseButtonEvent(1, (GetAsyncKeyState(VK_RBUTTON) & 0x8000) != 0);
@@ -11045,6 +12026,7 @@ static void ProxyImGuiDraw(ID3D12GraphicsCommandList* cl, ID3D12Resource* rt, bo
         MenuSectionNetwork009();
         MenuSectionNrControls();
         MenuSectionPreprocess();
+        MenuSectionHdr();
 
         ImGui::Separator();
         if (ImGui::Button("保存设置（独立备份）")) {
@@ -11085,19 +12067,7 @@ static void ProxyImGuiDraw(ID3D12GraphicsCommandList* cl, ID3D12Resource* rt, bo
         ImGui::End();
         ImGui::Render();
 
-        D3D12_CPU_DESCRIPTOR_HANDLE rtv = g_imguiRtvHeap->GetCPUDescriptorHandleForHeapStart();
-        g_dev->CreateRenderTargetView(rt, nullptr, rtv);
-        Barrier(cl, rt, outputState, D3D12_RESOURCE_STATE_RENDER_TARGET);
-        cl->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
-        D3D12_VIEWPORT vp{ 0, 0, (float)g_outW, (float)g_outH, 0, 1 };
-        D3D12_RECT sc{ 0, 0, (LONG)g_outW, (LONG)g_outH };
-        cl->RSSetViewports(1, &vp);
-        cl->RSSetScissorRects(1, &sc);
-        ImGui_ImplDX12_RenderDrawData(ImGui::GetDrawData(), cl);
-        Barrier(cl, rt, D3D12_RESOURCE_STATE_RENDER_TARGET, outputState);
-        // 恢复我们自己的描述符堆（ImGui 会改掉它；游戏随后会自设，但这里先还原）
-        ID3D12DescriptorHeap* hs[] = { g_heap.Get() };
-        cl->SetDescriptorHeaps(1, hs);
+        DrawImguiOffscreenAndComposite(cl, rt, outputState);
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         g_imguiFail = true;
         Log("ImGui: 绘制异常（已禁用）");

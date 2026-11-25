@@ -16,6 +16,8 @@
 #include <cstddef>
 #include <cmath>
 #include <limits>
+#include <mutex>
+#include <unordered_map>
 #include <d3dcompiler.h>
 #include <wrl/client.h>
 using Microsoft::WRL::ComPtr;
@@ -329,14 +331,35 @@ static_assert(sizeof(CoreParams) == 72 && sizeof(void*) == 8 && offsetof(CorePar
               offsetof(CoreParams, inputW) == 64 && offsetof(CoreParams, inputH) == 68,
               "CoreParams must match ProxyExecute's 72-byte XeSS-compatible layout");
 
+static std::mutex g_ctxMtx;
+static std::unordered_map<void*, uint32_t> g_ctxFlags;
+
 extern "C" __declspec(dllexport) ffxReturnCode_t ffxCreateContext(ffxContext* context, ffxCreateContextDescHeader* desc, const ffxAllocationCallbacks* memCb) {
     if (!LoadReal()) return FFX_API_RETURN_ERROR;
     g_realDispatchFn = (void*)&RealDispatchTrampoline;   // ★ 唯一的接缝注入
-    Logf("适配层: ffxCreateContext 转发（核心已接管真派发）");
-    return g_real.Create(context, desc, memCb);
+    uint32_t upscaleFlags = 0;
+    bool hasFlags = false;
+    for (const ffxApiHeader* h = desc; h; h = h->pNext) {
+        if (h->type == FFX_API_CREATE_CONTEXT_DESC_TYPE_UPSCALE) {
+            upscaleFlags = ((const ffxCreateContextDescUpscale*)h)->flags;
+            hasFlags = true;
+            break;
+        }
+    }
+    const ffxReturnCode_t rc = g_real.Create(context, desc, memCb);
+    if (rc == FFX_API_RETURN_OK && context && *context && hasFlags) {
+        std::lock_guard<std::mutex> lk(g_ctxMtx);
+        g_ctxFlags[*context] = upscaleFlags;
+    }
+    Logf("适配层: ffxCreateContext 转发（核心已接管真派发 hasFlags=%d flags=0x%X）", (int)hasFlags, upscaleFlags);
+    return rc;
 }
 
 extern "C" __declspec(dllexport) void ffxDestroyContext(ffxContext* context, const ffxAllocationCallbacks* memCb) {
+    if (context && *context) {
+        std::lock_guard<std::mutex> lk(g_ctxMtx);
+        g_ctxFlags.erase(*context);
+    }
     if (g_real.Destroy) g_real.Destroy(context, memCb);
 }
 
@@ -451,8 +474,22 @@ extern "C" __declspec(dllexport) ffxReturnCode_t ffxDispatch(ffxContext* context
     ad.output = ToAdapterRes(d->output);
     ad.renderSize = { d->renderSize.width, d->renderSize.height };
     ad.upscaleSize = { d->upscaleSize.width, d->upscaleSize.height };
+    uint32_t createFlags = 0;
+    bool flagsKnown = false;
+    {
+        std::lock_guard<std::mutex> lk(g_ctxMtx);
+        auto it = g_ctxFlags.find(*context);
+        if (it != g_ctxFlags.end()) { createFlags = it->second; flagsKnown = true; }
+    }
     ad.jitterOffset = { d->jitterOffset.x, d->jitterOffset.y };
     ad.reset = d->reset;
+    ad.createFlags = createFlags;
+    ad.flagsKnown = flagsKnown;
+    ad.isHdr = flagsKnown && ((createFlags & FFX_UPSCALE_ENABLE_HIGH_DYNAMIC_RANGE) != 0u);
+    ad.autoExposure = flagsKnown && ((createFlags & FFX_UPSCALE_ENABLE_AUTO_EXPOSURE) != 0u);
+    ad.isPq = (d->flags & FFX_UPSCALE_FLAG_NON_LINEAR_COLOR_PQ) != 0u;
+    ad.preExposure = (std::isfinite(d->preExposure) && d->preExposure > 1e-6f) ? d->preExposure : 1.0f;
+    ad.exposureScale = 1.0f;
     ad.okCode = FFX_API_RETURN_OK;
     ad.errCode = FFX_API_RETURN_ERROR_RUNTIME_ERROR;
     ad.nativeSize = sizeof(*d);

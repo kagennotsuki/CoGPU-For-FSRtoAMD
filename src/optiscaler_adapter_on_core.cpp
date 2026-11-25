@@ -7,7 +7,7 @@
 #include <windows.h>
 #include <intrin.h>
 #include <d3d12.h>
-#include <dxgi1_4.h>
+#include <dxgi1_6.h>
 #include <wrl/client.h>
 #include <cstdio>
 #include <cstdint>
@@ -28,6 +28,7 @@ extern "C" void CoreSetRuntimeBaseModule(HMODULE mod);
 extern "C" int  AmdNrNeedFinal();
 extern "C" int  AmdNrBbHandoff(void* cl, void* tex, unsigned frameTag);
 extern "C" void AmdNrSetPresentQueue(void* queue);
+extern "C" void AmdNrSetSwapChainHdrInfo(uint32_t bbFmt, int colorSpace, uint32_t outputHdr);
 extern "C" void* g_realDispatchFn;
 
 // ---- Minimal MSVC-ABI NGX declarations (matches NVSDK_NGX_Parameter vtable layout) ----
@@ -197,11 +198,22 @@ static bool GetFloat(const NVSDK_NGX_Parameter* p, const char* name, float* out)
     return true;
 }
 
+static bool TryGetUInt(const NVSDK_NGX_Parameter* p, const char* name, unsigned* out) {
+    if (!p || !p->vtbl || !out) return false;
+    unsigned u = 0;
+    if (p->Get(name, &u) == NVSDK_NGX_Result_Success) { *out = u; return true; }
+    int i = 0;
+    if (p->Get(name, &i) == NVSDK_NGX_Result_Success) { *out = static_cast<unsigned>(i); return true; }
+    return false;
+}
+
 // ---- Feature tracking ----
 struct TrackedFeature {
     int feature = -1;
     uint32_t createW = 0, createH = 0;
     uint32_t outW = 0, outH = 0;
+    uint32_t createFlags = 0;
+    bool flagsKnown = false;
     uint32_t evals = 0;
     bool logged = false;
 };
@@ -373,9 +385,14 @@ static NVSDK_NGX_Result __cdecl hk_create(ID3D12GraphicsCommandList* cmd, NVSDK_
             t.createH = GetUInt(p, "Height");
             t.outW = GetUInt(p, "OutWidth");
             t.outH = GetUInt(p, "OutHeight");
+            unsigned flags = 0;
+            if (TryGetUInt(p, "DLSS.Feature.Create.Flags", &flags)) {
+                t.createFlags = flags;
+                t.flagsKnown = true;
+            }
         }
-        Logf("OptiScaler CreateFeature id=%u feat=%d in=%ux%u out=%ux%u",
-             (*out)->Id, t.feature, t.createW, t.createH, t.outW, t.outH);
+        Logf("OptiScaler CreateFeature id=%u feat=%d in=%ux%u out=%ux%u flagsKnown=%d flags=0x%X",
+             (*out)->Id, t.feature, t.createW, t.createH, t.outW, t.outH, (int)t.flagsKnown, t.createFlags);
     }
     return r;
 }
@@ -410,8 +427,19 @@ static NVSDK_NGX_Result __cdecl hk_evaluate(ID3D12GraphicsCommandList* cmd, cons
             t.createH = GetUInt(p, "Height");
             t.outW = GetUInt(p, "OutWidth");
             t.outH = GetUInt(p, "OutHeight");
-            Logf("OptiScaler first-seen Evaluate id=%u callerOpti=%d inferredFeat=%d",
-                 h->Id, (caller == g_opti) ? 1 : 0, t.feature);
+            unsigned flags = 0;
+            if (TryGetUInt(p, "DLSS.Feature.Create.Flags", &flags)) {
+                t.createFlags = flags;
+                t.flagsKnown = true;
+            }
+            Logf("OptiScaler first-seen Evaluate id=%u callerOpti=%d inferredFeat=%d flagsKnown=%d flags=0x%X",
+                 h->Id, (caller == g_opti) ? 1 : 0, t.feature, (int)t.flagsKnown, t.createFlags);
+        } else if (!t.flagsKnown) {
+            unsigned flags = 0;
+            if (TryGetUInt(p, "DLSS.Feature.Create.Flags", &flags)) {
+                t.createFlags = flags;
+                t.flagsKnown = true;
+            }
         }
         tCopy = t;
     }
@@ -461,6 +489,9 @@ static NVSDK_NGX_Result __cdecl hk_evaluate(ID3D12GraphicsCommandList* cmd, cons
     float expoScale = 1.0f;
     if (!GetFloat(p, "DLSS.Exposure.Scale", &expoScale) || !std::isfinite(expoScale) || expoScale <= 0.0f)
         expoScale = 1.0f;
+    float preExposure = 1.0f;
+    if (!GetFloat(p, "DLSS.Pre.Exposure", &preExposure) || !std::isfinite(preExposure) || preExposure <= 1e-6f)
+        preExposure = 1.0f;
 
     unsigned rstU = 0;
     cur.hasReset = (p->Get("Reset", &rstU) == NVSDK_NGX_Result_Success);
@@ -544,6 +575,13 @@ static NVSDK_NGX_Result __cdecl hk_evaluate(ID3D12GraphicsCommandList* cmd, cons
     ad.upscaleSize = { ow, oh };
     ad.jitterOffset = { cur.jx, cur.jy };
     ad.reset = (rstU != 0);
+    ad.createFlags = tCopy.createFlags;
+    ad.flagsKnown = tCopy.flagsKnown;
+    ad.isHdr = tCopy.flagsKnown && ((tCopy.createFlags & (1u << 0)) != 0u);
+    ad.autoExposure = tCopy.flagsKnown && ((tCopy.createFlags & (1u << 6)) != 0u);
+    ad.isPq = false;
+    ad.preExposure = preExposure;
+    ad.exposureScale = expoScale;
     ad.okCode = NVSDK_NGX_Result_Success;
     ad.errCode = NVSDK_NGX_Result_Fail;
 
@@ -558,7 +596,7 @@ static NVSDK_NGX_Result __cdecl hk_evaluate(ID3D12GraphicsCommandList* cmd, cons
 using Microsoft::WRL::ComPtr;
 
 namespace Step2bDxgi {
-    enum Kind { kPresent = 0, kPresent1, kCreateSc, kCreateHwnd, kCreateCore, kCreateFac, kCreateFac1, kCreateFac2, kKindCount };
+    enum Kind { kPresent = 0, kPresent1, kSetColorSpace1, kCreateSc, kCreateHwnd, kCreateCore, kCreateFac, kCreateFac1, kCreateFac2, kKindCount };
     static constexpr int kSlots = 8;
 
     static std::mutex g_mtx;
@@ -566,6 +604,9 @@ namespace Step2bDxgi {
     static void* g_orig[kKindCount][kSlots]{};
     static int   g_used[kKindCount]{};
     static std::unordered_map<IDXGISwapChain*, ComPtr<ID3D12CommandQueue>> g_scQueues;
+    static std::unordered_map<IDXGISwapChain*, int> g_scColorSpaces;
+    static std::unordered_map<IDXGISwapChain*, uint32_t> g_scOutputHdrCache;
+    static std::unordered_map<IDXGISwapChain*, uint64_t> g_scOutputTickCache;
 
     static thread_local int t_creating = 0;
     static thread_local int t_presentDepth = 0;
@@ -607,10 +648,45 @@ namespace Step2bDxgi {
             queue = it->second;
         }
         AmdNrSetPresentQueue(queue.Get());
-        if (!AmdNrNeedFinal()) return;
 
         ComPtr<IDXGISwapChain3> sc3;
         if (FAILED(sc->QueryInterface(IID_PPV_ARGS(&sc3))) || !sc3) return;
+        {
+            DXGI_SWAP_CHAIN_DESC1 sd1{};
+            if (SUCCEEDED(sc3->GetDesc1(&sd1))) {
+                int recCs = -1;
+                uint32_t outHdr = 0;
+                const uint64_t nowTick = GetTickCount64();
+                bool needOutQuery = false;
+                {
+                    std::lock_guard<std::mutex> lk(g_mtx);
+                    auto itCs = g_scColorSpaces.find(sc);
+                    if (itCs != g_scColorSpaces.end()) recCs = itCs->second;
+                    auto itTick = g_scOutputTickCache.find(sc);
+                    if (itTick == g_scOutputTickCache.end() || (nowTick - itTick->second) > 2000) {
+                        needOutQuery = true;
+                        g_scOutputTickCache[sc] = nowTick;
+                    } else {
+                        outHdr = g_scOutputHdrCache[sc];
+                    }
+                }
+                if (needOutQuery) {
+                    ComPtr<IDXGIOutput> out;
+                    ComPtr<IDXGIOutput6> out6;
+                    DXGI_OUTPUT_DESC1 od1{};
+                    if (SUCCEEDED(sc->GetContainingOutput(&out)) && out &&
+                        SUCCEEDED(out.As(&out6)) && out6 && SUCCEEDED(out6->GetDesc1(&od1)) &&
+                        od1.ColorSpace == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020) {
+                        outHdr = 1u;
+                    }
+                    std::lock_guard<std::mutex> lk(g_mtx);
+                    g_scOutputHdrCache[sc] = outHdr;
+                }
+                AmdNrSetSwapChainHdrInfo(static_cast<uint32_t>(sd1.Format), recCs, outHdr);
+            }
+        }
+        if (!AmdNrNeedFinal()) return;
+
         const UINT bbIdx = sc3->GetCurrentBackBufferIndex();
         ComPtr<ID3D12Resource> bb;
         if (FAILED(sc3->GetBuffer(bbIdx, IID_PPV_ARGS(&bb))) || !bb) return;
@@ -722,6 +798,14 @@ namespace Step2bDxgi {
             --t_presentDepth;
             return hr;
         }
+        static HRESULT STDMETHODCALLTYPE set_colorspace1(IDXGISwapChain3* sc, DXGI_COLOR_SPACE_TYPE cs) {
+            if (sc) {
+                std::lock_guard<std::mutex> lk(g_mtx);
+                g_scColorSpaces[static_cast<IDXGISwapChain*>(sc)] = static_cast<int>(cs);
+            }
+            using Fn = HRESULT(STDMETHODCALLTYPE*)(IDXGISwapChain3*, DXGI_COLOR_SPACE_TYPE);
+            return reinterpret_cast<Fn>(g_orig[kSetColorSpace1][S])(sc, cs);
+        }
         static HRESULT STDMETHODCALLTYPE create_sc(IDXGIFactory* f, IUnknown* dev, DXGI_SWAP_CHAIN_DESC* desc, IDXGISwapChain** out) {
             ++t_creating;
             using Fn = HRESULT(STDMETHODCALLTYPE*)(IDXGIFactory*, IUnknown*, DXGI_SWAP_CHAIN_DESC*, IDXGISwapChain**);
@@ -771,9 +855,10 @@ namespace Step2bDxgi {
         }
         static void* of(Kind k) {
             switch (k) {
-            case kPresent:    return reinterpret_cast<void*>(&present);
-            case kPresent1:   return reinterpret_cast<void*>(&present1);
-            case kCreateSc:   return reinterpret_cast<void*>(&create_sc);
+            case kPresent:       return reinterpret_cast<void*>(&present);
+            case kPresent1:      return reinterpret_cast<void*>(&present1);
+            case kSetColorSpace1:return reinterpret_cast<void*>(&set_colorspace1);
+            case kCreateSc:      return reinterpret_cast<void*>(&create_sc);
             case kCreateHwnd: return reinterpret_cast<void*>(&create_hwnd);
             case kCreateCore: return reinterpret_cast<void*>(&create_core);
             case kCreateFac:  return reinterpret_cast<void*>(&create_fac);
@@ -841,8 +926,11 @@ namespace Step2bDxgi {
         AmdNrSetPresentQueue(queue.Get());
         const bool okP = HookVtableSlot(sc, 8, kPresent);
         const bool okP1 = sc1 ? HookVtableSlot(sc1.Get(), 22, kPresent1) : false;
-        Logf("Step2b: adopted swapchain=%p hwnd=%p queue=%p (Present=%d Present1=%d)",
-             (void*)sc, (void*)hwnd, (void*)queue.Get(), (int)okP, (int)okP1);
+        ComPtr<IDXGISwapChain3> sc3;
+        const bool okCs = SUCCEEDED(sc->QueryInterface(IID_PPV_ARGS(&sc3))) && sc3 &&
+                          HookVtableSlot(sc3.Get(), 38, kSetColorSpace1);
+        Logf("Step2b: adopted swapchain=%p hwnd=%p queue=%p (Present=%d Present1=%d SetCS=%d)",
+             (void*)sc, (void*)hwnd, (void*)queue.Get(), (int)okP, (int)okP1, (int)okCs);
     }
 
     static void AdoptFactory(void* fac) {

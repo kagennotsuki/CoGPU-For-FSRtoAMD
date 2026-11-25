@@ -3,7 +3,8 @@
 
 namespace A3 {
 enum View : UINT { Base, Mv, Fed, LocalAnswer, ComposeSrc, OutSrc, AnswerImage,
-                   FedUav, MvUav, ComposeUav, Add4kUav, ViewCount };
+                   Exposure, ScaleSrv, CommitSrv,
+                   FedUav, MvUav, ComposeUav, Add4kUav, ScaleUav, CommitUav, ViewCount };
 static inline UINT64 Bytes() { return A2In::Plane(); }
 static void* lastContext = nullptr;
 static bool everActive = false;
@@ -13,6 +14,10 @@ static ComPtr<ID3D12Resource> cache;
 struct Candidate { Key key; std::shared_ptr<A2In::Tail> tail; };
 static std::vector<Candidate> candidates;
 static std::vector<ComPtr<ID3D12Resource>> cachePool;
+static ComPtr<ID3D12Resource> commitTex[2], dummyExposure;
+static UINT commitIdx = 0;
+static UINT lastScaleHdrMode = 99;
+static ULONGLONG lastScaleTick = 0;
 
 static bool SameShape(const D3D12_RESOURCE_DESC& a, const D3D12_RESOURCE_DESC& b) {
     return a.Dimension == b.Dimension && a.Format == b.Format && a.Width == b.Width && a.Height == b.Height &&
@@ -22,6 +27,52 @@ static bool SameShape(const D3D12_RESOURCE_DESC& a, const D3D12_RESOURCE_DESC& b
 static bool Surface(const D3D12_RESOURCE_DESC& a) {
     return a.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D && a.SampleDesc.Count == 1 && a.DepthOrArraySize == 1;
 }
+static DXGI_FORMAT UnwrapColorFormat(DXGI_FORMAT fmt) {
+    switch (fmt) {
+    case DXGI_FORMAT_R16G16B16A16_TYPELESS: return DXGI_FORMAT_R16G16B16A16_FLOAT;
+    case DXGI_FORMAT_R16G16_TYPELESS:       return DXGI_FORMAT_R16G16_FLOAT;
+    case DXGI_FORMAT_R10G10B10A2_TYPELESS:  return DXGI_FORMAT_R10G10B10A2_UNORM;
+    case DXGI_FORMAT_R8G8B8A8_TYPELESS:     return DXGI_FORMAT_R8G8B8A8_UNORM;
+    case DXGI_FORMAT_B8G8R8A8_TYPELESS:     return DXGI_FORMAT_B8G8R8A8_UNORM;
+    case DXGI_FORMAT_R32_TYPELESS:          return DXGI_FORMAT_R32_FLOAT;
+    default: return fmt;
+    }
+}
+static DXGI_FORMAT UnwrapUavFormat(DXGI_FORMAT fmt) {
+    fmt = UnwrapColorFormat(fmt);
+    if (fmt == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB) return DXGI_FORMAT_R8G8B8A8_UNORM;
+    if (fmt == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB) return DXGI_FORMAT_B8G8R8A8_UNORM;
+    return fmt;
+}
+static bool IsReadableExposureTex(const D3D12_RESOURCE_DESC& desc) {
+    if (!Surface(desc)) return false;
+    if (desc.Flags & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE) return false;
+    switch (UnwrapColorFormat(desc.Format)) {
+    case DXGI_FORMAT_R32_FLOAT:
+    case DXGI_FORMAT_R16_FLOAT:
+    case DXGI_FORMAT_R16G16_FLOAT:
+    case DXGI_FORMAT_R16G16B16A16_FLOAT:
+    case DXGI_FORMAT_R32G32B32A32_FLOAT:
+    case DXGI_FORMAT_R8_UNORM:
+    case DXGI_FORMAT_R16_UNORM:
+    case DXGI_FORMAT_R8G8B8A8_UNORM:
+        return true;
+    default:
+        return false;
+    }
+}
+static UINT A3ResolveHdrMode(const AdapterFrameDesc& d, const D3D12_RESOURCE_DESC& color) {
+    if (g_hdrOverride == 1) return 0u;
+    if (g_hdrOverride == 2) return 1u;
+    if (g_hdrOverride == 3) return 2u;
+    if (d.isPq) return 2u;
+    const DXGI_FORMAT fmt = UnwrapColorFormat(color.Format);
+    const bool linearHdrFmt = (fmt == DXGI_FORMAT_R16G16B16A16_FLOAT ||
+                               fmt == DXGI_FORMAT_R11G11B10_FLOAT ||
+                               fmt == DXGI_FORMAT_R32G32B32A32_FLOAT);
+    if (d.isHdr && linearHdrFmt) return 1u;
+    return 0u;
+}
 static ComPtr<ID3D12Resource> FromDesc(D3D12_RESOURCE_DESC d) {
     D3D12_HEAP_PROPERTIES hp{}; hp.Type = D3D12_HEAP_TYPE_DEFAULT;
     hp.CreationNodeMask = hp.VisibleNodeMask = 1;
@@ -30,18 +81,25 @@ static ComPtr<ID3D12Resource> FromDesc(D3D12_RESOURCE_DESC d) {
                                    nullptr, IID_PPV_ARGS(&res));
     return res;
 }
+static ComPtr<ID3D12Resource> MakeReadback(UINT64 bytes) {
+    D3D12_HEAP_PROPERTIES hp{}; hp.Type = D3D12_HEAP_TYPE_READBACK;
+    hp.CreationNodeMask = hp.VisibleNodeMask = 1;
+    D3D12_RESOURCE_DESC bd{};
+    bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    bd.Width = bytes;
+    bd.Height = bd.DepthOrArraySize = bd.MipLevels = bd.SampleDesc.Count = 1;
+    bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    ComPtr<ID3D12Resource> res;
+    g_dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_COPY_DEST,
+                                   nullptr, IID_PPV_ARGS(&res));
+    return res;
+}
 static D3D12_CPU_DESCRIPTOR_HANDLE Handle(const Input& p, UINT i) {
     auto h = p.heap->GetCPUDescriptorHandleForHeapStart(); h.ptr += SIZE_T(i) * g_inc; return h;
 }
 static void Srv(const Input& p, UINT slot, ID3D12Resource* r) {
     D3D12_SHADER_RESOURCE_VIEW_DESC d{};
-    d.Format = r->GetDesc().Format;
-    switch (d.Format) {
-    case DXGI_FORMAT_R16G16B16A16_TYPELESS: d.Format = DXGI_FORMAT_R16G16B16A16_FLOAT; break;
-    case DXGI_FORMAT_R16G16_TYPELESS: d.Format = DXGI_FORMAT_R16G16_FLOAT; break;
-    case DXGI_FORMAT_R8G8B8A8_TYPELESS: d.Format = DXGI_FORMAT_R8G8B8A8_UNORM; break;
-    default: break;
-    }
+    d.Format = UnwrapColorFormat(r->GetDesc().Format);
     d.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
     d.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
     d.Texture2D.MipLevels = 1;
@@ -49,13 +107,7 @@ static void Srv(const Input& p, UINT slot, ID3D12Resource* r) {
 }
 static void Uav(const Input& p, UINT slot, ID3D12Resource* r) {
     D3D12_UNORDERED_ACCESS_VIEW_DESC d{};
-    d.Format = r->GetDesc().Format;
-    switch (d.Format) {
-    case DXGI_FORMAT_R16G16B16A16_TYPELESS: d.Format = DXGI_FORMAT_R16G16B16A16_FLOAT; break;
-    case DXGI_FORMAT_R16G16_TYPELESS: d.Format = DXGI_FORMAT_R16G16_FLOAT; break;
-    case DXGI_FORMAT_R8G8B8A8_TYPELESS: d.Format = DXGI_FORMAT_R8G8B8A8_UNORM; break;
-    default: break;
-    }
+    d.Format = UnwrapUavFormat(r->GetDesc().Format);
     d.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
     g_dev->CreateUnorderedAccessView(r, nullptr, &d, Handle(p, slot));
 }
@@ -77,7 +129,12 @@ static void ResetForScale() {
     for (auto& p : inputs) {
         p.netW = p.netH = 0;
         p.fed.Reset(); p.packed.Reset(); p.localAnswer.Reset(); p.answerImage.Reset();
+        p.scaleTex.Reset(); p.scaleRb.Reset();
+        p.hdrMode = 0; p.hasExposure = p.autoExposure = p.isHdrFlag = false;
+        p.preExposure = p.exposureScale = 1.0f;
     }
+    commitTex[0].Reset(); commitTex[1].Reset(); dummyExposure.Reset();
+    commitIdx = 0; lastScaleHdrMode = 99; lastScaleTick = 0;
     cache.Reset(); cacheAge.Clear(); cacheKey = {};
     candidates.clear();
     lastOffered = lastRecorded = lastNativeDispatch = -1;
@@ -101,8 +158,9 @@ static bool Prepare(Input& p, const AdapterFrameDesc& live) {
     // The inherited ResidCS UAV is typed and uses one mip. Don't advertise a
     // different physical resource layout as the game's input without proof.
     if (color.MipLevels != 1 || !g_rs || !g_psoDown || !g_psoMvPack || !g_psoResid) return false;
-    if (!p.composed || !SameShape(p.composed->GetDesc(), color)) {
-        p.composed = MakeTex(g_dev.Get(), UINT(color.Width), color.Height, color.Format, D3D12_RESOURCE_STATE_COMMON, true);
+    const DXGI_FORMAT compFmt = UnwrapUavFormat(color.Format);
+    if (!p.composed || !SameShape(p.composed->GetDesc(), color) || p.composed->GetDesc().Format != compFmt) {
+        p.composed = MakeTex(g_dev.Get(), UINT(color.Width), color.Height, compFmt, D3D12_RESOURCE_STATE_COMMON, true);
     }
     if (p.netW != kNetW || p.netH != kNetH) {
         p.fed.Reset(); p.packed.Reset(); p.localAnswer.Reset(); p.answerImage.Reset();
@@ -110,6 +168,11 @@ static bool Prepare(Input& p, const AdapterFrameDesc& live) {
     }
     if (!p.fed) p.fed = MakeTex(g_dev.Get(), kNetW, kNetH, DXGI_FORMAT_R16G16B16A16_FLOAT, D3D12_RESOURCE_STATE_COMMON, true);
     if (!p.packed) p.packed = MakeTex(g_dev.Get(), kNetW, kNetH, DXGI_FORMAT_R16G16_FLOAT, D3D12_RESOURCE_STATE_COMMON, true);
+    if (!p.scaleTex) p.scaleTex = MakeTex(g_dev.Get(), 1, 1, DXGI_FORMAT_R32G32B32A32_FLOAT, D3D12_RESOURCE_STATE_COMMON, true);
+    if (!p.scaleRb)  p.scaleRb = MakeReadback(D3D12_TEXTURE_DATA_PITCH_ALIGNMENT);
+    if (!commitTex[0]) commitTex[0] = MakeTex(g_dev.Get(), 1, 1, DXGI_FORMAT_R32G32B32A32_FLOAT, D3D12_RESOURCE_STATE_COMMON, true);
+    if (!commitTex[1]) commitTex[1] = MakeTex(g_dev.Get(), 1, 1, DXGI_FORMAT_R32G32B32A32_FLOAT, D3D12_RESOURCE_STATE_COMMON, true);
+    if (!dummyExposure) dummyExposure = MakeTex(g_dev.Get(), 1, 1, DXGI_FORMAT_R32_FLOAT, D3D12_RESOURCE_STATE_COMMON, false);
     if (!p.localAnswer) {
         D3D12_RESOURCE_DESC b{}; b.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER; b.Width = Bytes();
         b.Height = b.DepthOrArraySize = b.MipLevels = b.SampleDesc.Count = 1; b.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
@@ -117,17 +180,28 @@ static bool Prepare(Input& p, const AdapterFrameDesc& live) {
     }
     if (g_bypass && !p.answerImage) p.answerImage = MakeTex(g_dev.Get(), kNetW, kNetH, DXGI_FORMAT_R16G16B16A16_FLOAT,
                                                             D3D12_RESOURCE_STATE_COMMON, false);
-    if (!p.fed || !p.packed || !p.localAnswer || !p.composed || (g_bypass && !p.answerImage)) return false;
+    if (!p.fed || !p.packed || !p.localAnswer || !p.composed || !p.scaleTex ||
+        !commitTex[0] || !commitTex[1] || !dummyExposure || (g_bypass && !p.answerImage)) return false;
     if (!p.heap) {
         D3D12_DESCRIPTOR_HEAP_DESC hd{}; hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
         hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE; hd.NumDescriptors = ViewCount;
         if (FAILED(g_dev->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&p.heap)))) return false;
     }
+    p.hdrMode = A3ResolveHdrMode(d, color);
+    p.hasExposure = (p.source[3] && p.captured[3] && IsReadableExposureTex(p.captured[3]->GetDesc()));
+    p.autoExposure = d.autoExposure;
+    p.isHdrFlag = d.isHdr;
+    p.preExposure = (d.preExposure > 1e-4f) ? d.preExposure : 1.0f;
+    p.exposureScale = (d.exposureScale > 1e-4f) ? d.exposureScale : 1.0f;
+
     p.rs = g_rs; p.capturePso[0] = g_psoDown; p.capturePso[1] = g_psoMvPack;
     Srv(p, Base, p.captured[0].Get()); Srv(p, Mv, p.captured[1].Get()); Srv(p, Fed, p.fed.Get());
     Srv(p, ComposeSrc, p.composed.Get());
     if (p.answerImage) Srv(p, AnswerImage, p.answerImage.Get());
+    Srv(p, Exposure, p.hasExposure ? p.captured[3].Get() : dummyExposure.Get());
+    Srv(p, ScaleSrv, p.scaleTex.Get());
     Uav(p, FedUav, p.fed.Get()); Uav(p, MvUav, p.packed.Get()); Uav(p, ComposeUav, p.composed.Get());
+    Uav(p, ScaleUav, p.scaleTex.Get());
     D3D12_SHADER_RESOURCE_VIEW_DESC sd{};
     sd.Format = DXGI_FORMAT_R16G16B16A16_FLOAT; sd.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
     sd.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
@@ -147,6 +221,15 @@ static bool Capture(ID3D12GraphicsCommandList* cl, const AdapterFrameDesc& d,
     if (!raw) return false;
     auto& p = inputs[raw - A2In::slots];
     if (!Prepare(p, d)) { std::lock_guard lk(m); capture.Abort(); return false; }
+
+    g_a3LastHdrMode.store(p.hdrMode, std::memory_order_relaxed);
+    g_a3LastColorFmt.store((UINT)p.captured[0]->GetDesc().Format, std::memory_order_relaxed);
+    g_a3LastHasExpTex.store(p.hasExposure, std::memory_order_relaxed);
+    g_a3LastAutoExp.store(p.autoExposure, std::memory_order_relaxed);
+    g_a3LastIsHdrFlag.store(p.isHdrFlag, std::memory_order_relaxed);
+    g_a3LastPreExp.store(p.preExposure, std::memory_order_relaxed);
+    g_a3LastExpScale.store(p.exposureScale, std::memory_order_relaxed);
+
     const AdapterResource* r[] = {&d.color, &d.motionVectors, &d.depth, &d.exposure, &d.reactive, &d.transparencyAndComposition};
     for (UINT i = 0; i < 6; ++i) if (p.source[i]) {
         const auto st = r[i]->state;
@@ -157,16 +240,63 @@ static bool Capture(ID3D12GraphicsCommandList* cl, const AdapterFrameDesc& d,
         Barrier(cl, dst, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON);
         Barrier(cl, src, D3D12_RESOURCE_STATE_COPY_SOURCE, st);
     }
-    Bind(cl, p);
     auto* base = p.captured[0].Get(); auto* mv = p.captured[1].Get();
     auto* fed = p.fed.Get(); auto* packed = p.packed.Get();
     g_curJitX = d.jitterOffset.x; g_curJitY = d.jitterOffset.y;
+
+    const bool runHdrScale = (p.hdrMode != 0 && g_psoScale != nullptr);
+    ID3D12Resource* expRes = nullptr;
+    ID3D12Resource* prevCommit = nullptr;
+    ID3D12Resource* curCommit = nullptr;
+    if (runHdrScale) {
+        expRes = p.hasExposure ? p.captured[3].Get() : dummyExposure.Get();
+        prevCommit = commitTex[commitIdx ^ 1].Get();
+        curCommit = commitTex[commitIdx].Get();
+        Srv(p, CommitSrv, prevCommit);
+        Uav(p, CommitUav, curCommit);
+    }
+    Bind(cl, p);
     Barrier(cl, base, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
     Barrier(cl, mv, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    if (runHdrScale) {
+        const ULONGLONG nowTick = GetTickCount64();
+        const bool snapNow = (lastScaleHdrMode != p.hdrMode) || (nowTick - lastScaleTick > 1000);
+        lastScaleHdrMode = p.hdrMode;
+        lastScaleTick = nowTick;
+        Barrier(cl, expRes, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        Barrier(cl, prevCommit, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        Barrier(cl, curCommit, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        Barrier(cl, p.scaleTex.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        SetScalePass(cl, g_psoScale.Get(), Base, Exposure, CommitSrv, ScaleUav, CommitUav,
+                     p.heap.Get(), p.rs.Get(), p.hdrMode, p.hasExposure, p.preExposure, p.exposureScale, snapNow);
+        UavBarrier(cl, p.scaleTex.Get());
+        UavBarrier(cl, curCommit);
+        Barrier(cl, expRes, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
+        Barrier(cl, prevCommit, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
+        Barrier(cl, curCommit, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON);
+        commitIdx ^= 1u;
+        if (g_menuOpen && (key.frame % 15) == 0 && p.scaleRb) {
+            Barrier(cl, p.scaleTex.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+            D3D12_TEXTURE_COPY_LOCATION sl{}; sl.pResource = p.scaleTex.Get(); sl.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+            D3D12_TEXTURE_COPY_LOCATION dl{}; dl.pResource = p.scaleRb.Get(); dl.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+            dl.PlacedFootprint.Footprint.Format = DXGI_FORMAT_R32G32B32A32_FLOAT;
+            dl.PlacedFootprint.Footprint.Width = dl.PlacedFootprint.Footprint.Height = dl.PlacedFootprint.Footprint.Depth = 1;
+            dl.PlacedFootprint.Footprint.RowPitch = D3D12_TEXTURE_DATA_PITCH_ALIGNMENT;
+            cl->CopyTextureRegion(&dl, 0, 0, 0, &sl, nullptr);
+            Barrier(cl, p.scaleTex.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        } else {
+            Barrier(cl, p.scaleTex.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        }
+    }
     Barrier(cl, fed, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     Barrier(cl, packed, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-    SetPass(cl, p.capturePso[0].Get(), Base, Base, Mv, Base, LocalAnswer, FedUav, MvUav, kNetW, kNetH, p.heap.Get(), p.rs.Get());
-    SetPass(cl, p.capturePso[1].Get(), Mv, Mv, Mv, Base, LocalAnswer, MvUav, FedUav, kNetW, kNetH, p.heap.Get(), p.rs.Get());
+    SetPass(cl, p.capturePso[0].Get(), Base, runHdrScale ? ScaleSrv : Base, Mv, Base, LocalAnswer, FedUav, MvUav,
+            kNetW, kNetH, p.heap.Get(), p.rs.Get(), false, runHdrScale ? p.hdrMode : 0u);
+    SetPass(cl, p.capturePso[1].Get(), Mv, Mv, Mv, Base, LocalAnswer, MvUav, FedUav,
+            kNetW, kNetH, p.heap.Get(), p.rs.Get(), false, 0u);
+    if (runHdrScale) {
+        Barrier(cl, p.scaleTex.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
+    }
     Barrier(cl, base, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
     Barrier(cl, mv, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
     Barrier(cl, fed, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
@@ -236,6 +366,18 @@ static void Notify(Key key) {
 }
 static void Compose(ID3D12GraphicsCommandList* cl, Input& p, Answer& a, F9Id::ARecord& f9, bool bypass) {
     auto* ans = p.localAnswer.Get(); auto* color = p.captured[0].Get();
+    const bool useHdrScale = (p.hdrMode != 0 && p.scaleTex != nullptr);
+    if (g_menuOpen && useHdrScale && p.scaleRb) {
+        D3D12_RANGE rr{0, 16}; void* mapped = nullptr;
+        if (SUCCEEDED(p.scaleRb->Map(0, &rr, &mapped)) && mapped) {
+            const float v = *static_cast<const float*>(mapped);
+            if (std::isfinite(v) && v > 0.01f && v < 256.0f) {
+                g_a3LastDivisor.store(v, std::memory_order_relaxed);
+            }
+            D3D12_RANGE wr{0, 0};
+            p.scaleRb->Unmap(0, &wr);
+        }
+    }
     Barrier(cl, a.bufA.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE);
     Barrier(cl, ans, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST);
     cl->CopyBufferRegion(ans, 0, a.bufA.Get(), 0, Bytes());
@@ -253,14 +395,22 @@ static void Compose(ID3D12GraphicsCommandList* cl, Input& p, Answer& a, F9Id::AR
     f9.AnswerPath(F9Id::GpuResidual);
     Bind(cl, p);
     Barrier(cl, color, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    if (useHdrScale) {
+        Barrier(cl, p.scaleTex.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    }
     Barrier(cl, p.fed.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
     Barrier(cl, p.composed.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     g_curJitX = p.desc.jitterOffset.x; g_curJitY = p.desc.jitterOffset.y;
     p.presentPso[0] = g_psoResid;
     const auto shape = color->GetDesc();
-    SetPass(cl, p.presentPso[0].Get(), Base, bypass ? AnswerImage : Base, Base, Fed, LocalAnswer,
-            ComposeUav, ComposeUav, UINT(shape.Width), shape.Height, p.heap.Get(), p.rs.Get(), bypass);
+    SetPass(cl, p.presentPso[0].Get(), Base, bypass ? AnswerImage : Base,
+            useHdrScale ? ScaleSrv : Base, Fed, LocalAnswer,
+            ComposeUav, ComposeUav, UINT(shape.Width), shape.Height,
+            p.heap.Get(), p.rs.Get(), bypass, p.hdrMode);
     Barrier(cl, p.composed.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON);
+    if (useHdrScale) {
+        Barrier(cl, p.scaleTex.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
+    }
     Barrier(cl, color, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
     Barrier(cl, p.fed.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
     Barrier(cl, ans, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
@@ -268,9 +418,10 @@ static void Compose(ID3D12GraphicsCommandList* cl, Input& p, Answer& a, F9Id::AR
 }
 static bool CanAdd4k(Input& p, ID3D12Resource* out) {
     if (!g_resid4k || !g_psoAdd4K) return false;
-    const auto shape = out->GetDesc();
-    if (!p.add4k || !SameShape(p.add4k->GetDesc(), shape)) {
-        auto d = shape; d.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+    auto want = out->GetDesc();
+    want.Format = UnwrapUavFormat(want.Format);
+    if (!p.add4k || !SameShape(p.add4k->GetDesc(), want)) {
+        auto d = want; d.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
         p.add4k = FromDesc(d);
     }
     if (!p.add4k) return false;
@@ -288,7 +439,7 @@ static void Add4k(ID3D12GraphicsCommandList* cl, Input& p, ID3D12Resource* out, 
     Barrier(cl, dst, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     const auto d = out->GetDesc();
     SetPass(cl, p.presentPso[1].Get(), OutSrc, ComposeSrc, Base, Fed, LocalAnswer,
-            Add4kUav, Add4kUav, UINT(d.Width), d.Height, p.heap.Get(), p.rs.Get());
+            Add4kUav, Add4kUav, UINT(d.Width), d.Height, p.heap.Get(), p.rs.Get(), false, p.hdrMode);
     Barrier(cl, dst, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
     Barrier(cl, out, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
     cl->CopyResource(out, dst);
