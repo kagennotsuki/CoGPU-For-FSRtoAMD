@@ -135,6 +135,7 @@ static struct {
     float localStruct = 1.0f;
     float skinStruct = -1.0f;
     unsigned useAutoMask = 0u;
+    bool neutralOverride = false;
 } g_nb;
 
 // ------------------------------------------------------------------ helpers
@@ -173,12 +174,16 @@ static float NbClampControl(float v, float lo, float hi, float def) {
 }
 
 static void NbApplyStyleControls(NgxParam* p) {
-    NbSetF(p, "DLSSNR.Intensity", g_nb.intensity);
-    NbSetU(p, "DLSSNR.Style", g_nb.style);
+    NbSetF(p, "DLSSNR.Intensity", g_nb.neutralOverride ? 1.0f : g_nb.intensity);
+    NbSetU(p, "DLSSNR.Style", g_nb.neutralOverride ? 0u : g_nb.style);
     NbSetF(p, "DLSSNR.LocalToneStrength", g_nb.localTone);
     NbSetF(p, "DLSSNR.LocalStructureStrength", g_nb.localStruct);
     NbSetF(p, "DLSSNR.SkinStructureStrength", g_nb.skinStruct);
     NbSetU(p, "DLSSNR.UseAutoMask", g_nb.useAutoMask);
+}
+
+extern "C" void NgxBackendSetNeutralOverride(bool neutral) {
+    g_nb.neutralOverride = neutral;
 }
 
 // ------------------------------------------------------------------ public

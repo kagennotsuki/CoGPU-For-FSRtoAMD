@@ -29,6 +29,10 @@
   - 支持在 `Del` 菜单内直接切换 `固定 1080p`、`50% / 67% / 75% / 100% 渲染分辨率`、`固定 720p / 900p / 1440p` 共 8 档（默认保持经典 `1080p`），自动安全排空双卡队列并重建跨卡共享资源与 0.0.9 会话（`F7 / F8` 跑马灯与三横带诊断已在 A/B 双形态统一关闭）。
 - **GPU 预处理实装（`[Preprocess]`）**：
   - 在 `DownCS` / `kBformDS` 计算着色器内直接支持预处理总开关、曝光增益（EV Bias）、色调曲线（`none / neutral / reinhard / filmic / gt / aces / agx`）、中灰对比度与饱和度调节，并同步 `dlssnr-amd.ini` 与 `xess_proxy.saved.ini`。
+- **完整 HDR10 PQ / scRGB 管线支持（A & B 双形态）**：
+  - 支持游戏内 `HDR10 PQ` (`R10G10B10A2_UNORM` / ST.2084) 与 `scRGB` (`RGBA16F`) 自动识别、线性归一化喂图及双形态无损彩色/高亮峰值还原。
+- **多遍快速叠层 (`Passes fast` · 移植自 `DLSSNR-AMD v0.0.9`)**：
+  - 在神经卡单次 `dlssnr_core` 推理下等效 `2 ~ 8` 遍 DLSS5 叠层：支持 `Interleaved`（跨帧 N 槽位交错积累 + 6 级 Push-Pull 补洞 + 中性核心接管）、`Extrapolation`、`Feedback`、`Hybrid` 与 `Edit strength` 共 5 种模式（开启时核心统一使用 `RGBA16F`，A/B 双形态与 SDR/HDR 全共用）。
 - **完整菜单控制与配置持久化（快捷键 `Del`）**：
   - 0.0.9 网络模型热切换（`CC_SMALL_FP8_EXPERIMENTAL` / `CC_SMALL_FP8` / `CC_SILVER_AARDWOLD_OPTIMIZED` / `CC_SILVER_AARDWOLD`）、优化档位、16/32-bit 历史精度、Style Grade、NR Scale、Intensity/Style/LocalTone/LocalStruct/SkinStruct 控制与保存/撤销/恢复默认按钮。
 
@@ -119,9 +123,9 @@ powershell -ExecutionPolicy Bypass -File .\scripts\build_ffx_proxy.ps1
 
 | 文件 | 大小 (Bytes) | SHA256 |
 |---|---:|---|
-| `prebuilt/OptiScaler/plugins/cogpu_nr.asi` | `1,112,064` | `11E4343B0A8A5C8DB623971B57BFB3ACC28ED072549A707F5D2C2C5EE4DF2EB9` |
+| `prebuilt/OptiScaler/plugins/cogpu_nr.asi` | `1,228,288` | `0C05018D45871F17965B6DDEE5E7EEAFF3E07C0736B8754F95DD9AB210E3FF54` |
 | `prebuilt/dlssnr_core.dll` | `6,035,547` | `89CBA727B4440EA99F74354DB866285C3498044DFB43EF8E905EF4ECAF617642` |
-| `prebuilt/standalone_ffx_proxy/amd_fidelityfx_upscaler_dx12.dll` | `1,081,344` | `7E19A3DCB975ED4A3A37812BD889BA423F577F1E60476FB93A2589E3F1FC7173` |
+| `prebuilt/standalone_ffx_proxy/amd_fidelityfx_upscaler_dx12.dll` | `1,197,568` | `DB7D2DDC6E1FE141FE8D6FF43EBE4C9F40655F954A12E2AAD0CF590ECEAD469D` |
 
 ---
 

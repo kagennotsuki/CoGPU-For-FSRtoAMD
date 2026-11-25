@@ -717,9 +717,21 @@ extern "C" bool NgxBackendEval(ID3D12GraphicsCommandList* cl, ID3D12Resource* co
                                unsigned w, unsigned h, bool reset, float mvScaleX, float mvScaleY);
 extern "C" void NgxBackendSetControls(float intensity, unsigned style, float localTone,
                                       float localStruct, float skinStruct, unsigned useAutoMask);
+extern "C" void NgxBackendSetNeutralOverride(bool neutral);
 extern "C" void* NgxBackendOutput();
 extern "C" DXGI_FORMAT NgxBackendFormat();
 extern "C" bool  NgxBackendActive();
+#include "fast_passes.h"
+static FastPasses::Engine g_fastEngine;
+static bool  g_fastOn           = false;
+static int   g_fastMethod       = 0;      // 0=Interleaved, 1=Extrapolation, 2=Feedback, 3=Hybrid, 4=Edit strength
+static float g_fastPasses       = 3.0f;
+static int   g_fastIlPasses     = 3;
+static bool  g_fastHaloLimit    = false;
+static float g_fastFine         = 1.0f;
+static float g_fastEditStrength = 2.0f;
+static int   g_fastEffMethod    = -1;
+static bool  g_fastNeutralLive  = false;
 static bool g_backendNgx = false;
 static volatile LONG  g_c4On = 0;                   // xess_proxy.c4.txt = 1 才跑（ProxyExecute init 读一次）
 static bool g_backendRead = false;
@@ -839,6 +851,22 @@ static volatile float g_nrSkin = -1.0f, g_nrGrade = 2.0f;
 static volatile int   g_nrStyle = 0;                 // 0 Default / 1 Natural / 2 Cinematic
 static volatile bool  g_nrAutoMask = false, g_nrCtrlOn = true;
 static volatile bool  g_ctrlDirty = true;            // 让 worker 下一帧重新下发
+static FastPasses::Settings CurrentFastSettings() {
+    FastPasses::Settings s{};
+    const bool ctrlOn = (bool)g_nrCtrlOn;
+    const int st = (int)g_nrStyle;
+    const float inten = (float)g_nrIntensity;
+    s.enabled      = g_fastOn;
+    s.method       = std::clamp(g_fastMethod, 0, 4);
+    s.passes       = std::clamp(g_fastPasses, 0.5f, 8.0f);
+    s.ilPasses     = std::clamp(g_fastIlPasses, 2, 8);
+    s.haloLimit    = g_fastHaloLimit;
+    s.fine         = std::clamp(g_fastFine, 0.0f, 3.0f);
+    s.editStrength = std::clamp(g_fastEditStrength, 0.0f, 4.0f);
+    s.style        = (ctrlOn && st >= 0 && st <= 2) ? (uint32_t)st : 0u;
+    s.intensity    = ctrlOn ? std::clamp(inten, 0.0f, 2.0f) : 1.0f;
+    return s;
+}
 
 // ============ BTRACE1 观测接缝（纯观测，不改 GPU 调用次数/顺序/参数） ============
 
@@ -2620,7 +2648,9 @@ static void WorkerMain() {
                 Barrier(W.cl.Get(), W.vel.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON);
                 W.ngxMvState = D3D12_RESOURCE_STATE_COMMON;
             }
-            const DXGI_FORMAT wantNgxFmt = useFp16Ngx ? DXGI_FORMAT_R16G16B16A16_FLOAT : DXGI_FORMAT_R8G8B8A8_UNORM;
+            const FastPasses::Settings fastCfg = CurrentFastSettings();
+            const bool fastWantActive = fastCfg.enabled && (FastPasses::EffectiveMethod(fastCfg, W.vel != nullptr) >= 0);
+            const DXGI_FORMAT wantNgxFmt = (useFp16Ngx || fastWantActive) ? DXGI_FORMAT_R16G16B16A16_FLOAT : DXGI_FORMAT_R8G8B8A8_UNORM;
             if (!holdNoNew && NgxBackendActive() && NgxBackendFormat() != wantNgxFmt) {
                 if (W.ngx[NgxReadback].lastFv) WaitWFence(W.ngx[NgxReadback].lastFv, kWorkerWaitMs);
                 if (W.ngx[NgxCompose].lastFv)  WaitWFence(W.ngx[NgxCompose].lastFv, kWorkerWaitMs);
@@ -2653,6 +2683,7 @@ static void WorkerMain() {
             }
             const bool skipEval = holdNoNew || (!bPrep && !freshA);
             const bool resetA = freshA && feedAGen != lastEvaluatedAGen;
+            const bool doNgxReset = (W.processed < 3 || resetA || resetReasons != 0);
             F9Id::WRecord f9Eval(W.cl.Get(), W.dev.Get(), f9Dispatch, feedAGen, feedAResetEpoch);
             ID3D12Resource* ngxColorIn = useFp16Ngx ? W.colorFp16.Get() : W.color.Get();
             if (f9Eval.part && freshA && !skipEval && ensureOk) {
@@ -2665,12 +2696,40 @@ static void WorkerMain() {
                 F9Id::Count(F9Id::WColor, F9Id::NotProduced);
                 F9Id::Count(F9Id::WMv, F9Id::NotProduced);
             }
-            const bool evalOk = !skipEval && ensureOk && NgxBackendEval(W.cl.Get(), ngxColorIn, W.vel.Get(),
-                                                           kNetW, kNetH, W.processed < 3 || resetA || resetReasons != 0,
+            ID3D12Resource* ngxFeedIn = ngxColorIn;
+            bool fastPreDone = false;
+            int fastEff = -1;
+            bool fastNeutral = false;
+            if (!skipEval && ensureOk) {
+                if (doNgxReset) g_fastEngine.InvalidateHistory();
+                if (fastWantActive) {
+                    std::string fastErr;
+                    if (g_fastEngine.Ensure(W.dev.Get(), kNetW, kNetH, fastCfg, fastErr)) {
+                        D3D12_RESOURCE_STATES colSt = useFp16Ngx ? W.ngxColFp16State : W.ngxColState;
+                        ngxFeedIn = g_fastEngine.RecordPre(
+                            W.cl.Get(), ngxColorIn, colSt,
+                            W.vel.Get(), W.ngxMvState, W.ngxMvX, W.ngxMvY,
+                            doNgxReset, fastCfg, fastEff, fastNeutral);
+                        fastPreDone = (fastEff >= 0 && g_fastEngine.DidPreThisFrame());
+                    } else if (!fastErr.empty()) {
+                        static bool s_loggedFastErr = false;
+                        if (!s_loggedFastErr) { s_loggedFastErr = true; Log("FAST-PASSES: Ensure failed: %s", fastErr.c_str()); }
+                    }
+                }
+                g_fastEffMethod = fastEff;
+                g_fastNeutralLive = fastNeutral;
+                NgxBackendSetNeutralOverride(fastPreDone && fastNeutral);
+            }
+            const bool evalOk = !skipEval && ensureOk && NgxBackendEval(W.cl.Get(), ngxFeedIn, W.vel.Get(),
+                                                           kNetW, kNetH, doNgxReset,
                                                            W.ngxMvX, W.ngxMvY);
             if (evalOk) {   // the core samples colour/MV in place and leaves them shader-readable
-                if (useFp16Ngx) W.ngxColFp16State = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
-                else            W.ngxColState     = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+                if (ngxFeedIn == ngxColorIn) {
+                    if (useFp16Ngx) W.ngxColFp16State = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+                    else            W.ngxColState     = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+                } else {
+                    g_fastEngine.NotifyEvalFedFastIn(true);
+                }
                 W.ngxMvState  = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
             }
             BtTrace("BPREP_END", frameId, "prep",
@@ -2710,22 +2769,31 @@ static void WorkerMain() {
                 }
                 if (keepOutput) po = (ID3D12Resource*)NgxBackendOutput();
             }
+            const bool wantFastPost = po && fastPreDone && g_fastEngine.DidPreThisFrame();
+            bool fastPostOk = false;
             if (!po) {
                 if (f9Eval.part && useAInput) F9Id::Count(F9Id::WAnswer, F9Id::NotProduced);
                 static int nb = 0;
                 if ((nb++ % 120) == 0) Log("NGX: no answer this frame (ensure=%d eval=%d)", (int)ensureOk, (int)evalOk);
             } else if (a3Wake) {
                 if (!a3.a || !ResetNgxBatch(W, NgxReadback, "a3-writeback")) continue;
+                if (wantFastPost) {
+                    fastPostOk = g_fastEngine.RecordPost(
+                        W.cl.Get(), ngxColorIn, useFp16Ngx ? W.ngxColFp16State : W.ngxColState,
+                        po, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, fastCfg, false);
+                }
+                ID3D12Resource* copySrc = fastPostOk ? g_fastEngine.FastOutTex() : po;
+                const D3D12_RESOURCE_STATES copySrcSt = fastPostOk ? D3D12_RESOURCE_STATE_COMMON : D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
                 F9Id::WRecord f9Answer(W.cl.Get(), W.dev.Get(), f9Dispatch, feedAGen, feedAResetEpoch);
-                F9Id::Transition(W.cl.Get(), po, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+                F9Id::Transition(W.cl.Get(), copySrc, copySrcSt, D3D12_RESOURCE_STATE_COPY_SOURCE);
                 F9Id::Transition(W.cl.Get(), a3.a->bufW.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST);
-                f9Answer.Tap(F9Id::WAnswer, po, D3D12_RESOURCE_STATE_COPY_SOURCE, frameId, frameId,
+                f9Answer.Tap(F9Id::WAnswer, copySrc, D3D12_RESOURCE_STATE_COPY_SOURCE, frameId, frameId,
                              F9Id::Shared, A3::Audit(*a3.a));
                 const auto dst = A2In::Foot(a3.a->bufW.Get(), DXGI_FORMAT_R16G16B16A16_FLOAT, 0);
-                const auto src = A2In::Tex(po);
+                const auto src = A2In::Tex(copySrc);
                 W.cl->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
                 F9Id::Transition(W.cl.Get(), a3.a->bufW.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON);
-                F9Id::Transition(W.cl.Get(), po, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+                F9Id::Transition(W.cl.Get(), copySrc, D3D12_RESOURCE_STATE_COPY_SOURCE, copySrcSt);
                 const bool submitted = SUCCEEDED(W.cl->Close()) && SubmitNgxBatch(W, NgxReadback, "a3-writeback");
                 f9Answer.Finish(submitted, true, W.q.Get(), W.fe.Get(), W.fv);
                 a3.Submitted(submitted, W.fe.Get(), W.fv, f9Dispatch);
@@ -2735,7 +2803,8 @@ static void WorkerMain() {
                     A3::SettleWriter(f9Dispatch);
                 }
             } else {
-                D3D12_RESOURCE_DESC pd = po->GetDesc();
+                ID3D12Resource* preCopySrc = wantFastPost ? g_fastEngine.FastOut8Tex() : po;
+                D3D12_RESOURCE_DESC pd = preCopySrc->GetDesc();
                 D3D12_RESOURCE_DESC pl = pd; pl.Flags = D3D12_RESOURCE_FLAG_NONE;
                 UINT rows2 = 0; UINT64 rs2 = 0, tot2 = 0;
                 W.dev->GetCopyableFootprints(&pl, 0, 1, 0, &W.fpPriv, &rows2, &rs2, &tot2);
@@ -2756,16 +2825,23 @@ static void WorkerMain() {
                 }
                 // second submission: this is where the answer is copied out (one frame late)
                 if (!W.rbPriv || !ResetNgxBatch(W, NgxReadback, "readback")) continue;
+                if (wantFastPost) {
+                    fastPostOk = g_fastEngine.RecordPost(
+                        W.cl.Get(), ngxColorIn, useFp16Ngx ? W.ngxColFp16State : W.ngxColState,
+                        po, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, fastCfg, true);
+                }
+                ID3D12Resource* copySrc = fastPostOk ? g_fastEngine.FastOut8Tex() : po;
+                const D3D12_RESOURCE_STATES copySrcSt = fastPostOk ? D3D12_RESOURCE_STATE_COMMON : D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
                 D3D12_RESOURCE_BARRIER nb2{};
                 nb2.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
                 nb2.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-                nb2.Transition.pResource = po;
-                nb2.Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+                nb2.Transition.pResource = copySrc;
+                nb2.Transition.StateBefore = copySrcSt;
                 nb2.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
                 W.cl->ResourceBarrier(1, &nb2);
                 F9Id::WRecord f9Answer(W.cl.Get(), W.dev.Get(), f9Dispatch, feedAGen, feedAResetEpoch);
                 if (useAInput && g_xOk && g_xBufOutW) {   // 只有 A 输入产生的答案才写 A 跨卡通道
-                    f9Answer.Tap(F9Id::WAnswer, po, D3D12_RESOURCE_STATE_COPY_SOURCE, frameId, frameId, F9Id::Shared);
+                    f9Answer.Tap(F9Id::WAnswer, copySrc, D3D12_RESOURCE_STATE_COPY_SOURCE, frameId, frameId, F9Id::Shared);
                     D3D12_TEXTURE_COPY_LOCATION xd{};
                     xd.pResource = g_xBufOutW.Get();
                     xd.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
@@ -2776,7 +2852,7 @@ static void WorkerMain() {
                     xd.PlacedFootprint.Footprint.Depth = 1;
                     xd.PlacedFootprint.Footprint.RowPitch = kNetW * 4;
                     D3D12_TEXTURE_COPY_LOCATION xs{};
-                    xs.pResource = po;
+                    xs.pResource = copySrc;
                     xs.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
                     xs.SubresourceIndex = 0;
                     W.cl->CopyTextureRegion(&xd, 0, 0, 0, &xs, nullptr);
@@ -2786,12 +2862,12 @@ static void WorkerMain() {
                 dd.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
                 dd.PlacedFootprint = W.fpPriv;
                 D3D12_TEXTURE_COPY_LOCATION ss{};
-                ss.pResource = po;
+                ss.pResource = copySrc;
                 ss.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
                 ss.SubresourceIndex = 0;
                 W.cl->CopyTextureRegion(&dd, 0, 0, 0, &ss, nullptr);
                 nb2.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
-                nb2.Transition.StateAfter = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;   // restore: the core writes it again
+                nb2.Transition.StateAfter = copySrcSt;
                 W.cl->ResourceBarrier(1, &nb2);
                 g_tlCloseHr = W.cl->Close();
                 const bool submittedReadback = SUCCEEDED(g_tlCloseHr) && SubmitNgxBatch(W, NgxReadback, "readback");
@@ -2850,12 +2926,14 @@ static void WorkerMain() {
                         W.cl->Close();   // discard the empty recording
                         break;
                     }
-                    Barrier(W.cl.Get(), po, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON);
+                    ID3D12Resource* bAnsTex = fastPostOk ? g_fastEngine.FastOutTex() : po;
+                    const D3D12_RESOURCE_STATES bAnsRestState = fastPostOk ? D3D12_RESOURCE_STATE_COMMON : D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+                    Barrier(W.cl.Get(), bAnsTex, bAnsRestState, D3D12_RESOURCE_STATE_COMMON);
                     // B 形态已关闭 F8 三横带诊断，直接走正常 BformBCompose 合成
-                    const bool recorded = BformBCompose(W.cl.Get(), po, slot);
+                    const bool recorded = BformBCompose(W.cl.Get(), bAnsTex, slot);
                     const bool upRecorded = recorded && upscale && BformBUpscale(W.cl.Get(), slot);
-                    if (recorded) BformDiagEnqueue(W, po, slot, upRecorded);
-                    Barrier(W.cl.Get(), po, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+                    if (recorded) BformDiagEnqueue(W, bAnsTex, slot, upRecorded);
+                    Barrier(W.cl.Get(), bAnsTex, D3D12_RESOURCE_STATE_COMMON, bAnsRestState);
                     g_tlCloseHr = W.cl->Close();
                     if (FAILED(g_tlCloseHr)) { NrHardFail("B1: NGX compose command list close failed"); break; }
                     if (recorded) {
@@ -3405,6 +3483,10 @@ struct Params {
     // HDR
     int   hdrOverride, hdrCurve, hdrExpSource;
     float hdrWhiteScale, hdrPqWhiteNits, hdrChromaClamp;
+    // Passes (fast) 多遍叠层
+    bool  fastOn, fastHaloLimit;
+    int   fastMethod, fastIlPasses;
+    float fastPasses, fastFine, fastEditStrength;
 };
 static Params g_sessionStart{};
 static bool   g_sessionStartValid = false;
@@ -3428,6 +3510,9 @@ static Params CaptureParams() {
     p.diagLogOn = (g_diagLogOn != 0);
     p.hdrOverride = g_hdrOverride; p.hdrCurve = g_hdrCurve; p.hdrExpSource = g_hdrExpSource;
     p.hdrWhiteScale = g_hdrWhiteScale; p.hdrPqWhiteNits = g_hdrPqWhiteNits; p.hdrChromaClamp = g_hdrChromaClamp;
+    p.fastOn = g_fastOn; p.fastMethod = g_fastMethod; p.fastPasses = g_fastPasses;
+    p.fastIlPasses = g_fastIlPasses; p.fastHaloLimit = g_fastHaloLimit;
+    p.fastFine = g_fastFine; p.fastEditStrength = g_fastEditStrength;
     return p;
 }
 static void ApplyParams(const Params& p) {
@@ -3459,6 +3544,13 @@ static void ApplyParams(const Params& p) {
     g_hdrWhiteScale  = std::clamp(p.hdrWhiteScale, 0.1f, 8.0f);
     g_hdrPqWhiteNits = std::clamp(p.hdrPqWhiteNits, 80.0f, 1000.0f);
     g_hdrChromaClamp = std::clamp(p.hdrChromaClamp, 0.0f, 1.0f);
+    g_fastOn           = p.fastOn;
+    g_fastMethod       = std::clamp(p.fastMethod, 0, 4);
+    g_fastPasses       = std::clamp(p.fastPasses, 0.5f, 8.0f);
+    g_fastIlPasses     = std::clamp(p.fastIlPasses, 2, 8);
+    g_fastHaloLimit    = p.fastHaloLimit;
+    g_fastFine         = std::clamp(p.fastFine, 0.0f, 3.0f);
+    g_fastEditStrength = std::clamp(p.fastEditStrength, 0.0f, 4.0f);
     g_ctrlDirty = true;
 }
 static Params FactoryParams() {
@@ -3478,6 +3570,8 @@ static Params FactoryParams() {
     p.diagLogOn = true;
     p.hdrOverride = 0; p.hdrCurve = 0; p.hdrExpSource = 0;
     p.hdrWhiteScale = 1.0f; p.hdrPqWhiteNits = 203.0f; p.hdrChromaClamp = 1.0f;
+    p.fastOn = false; p.fastMethod = 0; p.fastPasses = 3.0f;
+    p.fastIlPasses = 3; p.fastHaloLimit = false; p.fastFine = 1.0f; p.fastEditStrength = 2.0f;
     return p;
 }
 static bool SaveParamsToFile(const Params& p) {
@@ -3501,6 +3595,8 @@ static bool SaveParamsToFile(const Params& p) {
     fprintf(f, "diag_log=%d\n", (int)p.diagLogOn);
     fprintf(f, "hdr_override=%d\nhdr_curve=%d\nhdr_exp_source=%d\nhdr_white_scale=%.6f\nhdr_pq_white_nits=%.2f\nhdr_chroma_clamp=%.3f\n",
             p.hdrOverride, p.hdrCurve, p.hdrExpSource, p.hdrWhiteScale, p.hdrPqWhiteNits, p.hdrChromaClamp);
+    fprintf(f, "fast_on=%d\nfast_method=%d\nfast_passes=%.6f\nfast_il_passes=%d\nfast_halo_limit=%d\nfast_fine=%.6f\nfast_edit_strength=%.6f\n",
+            (int)p.fastOn, p.fastMethod, p.fastPasses, p.fastIlPasses, (int)p.fastHaloLimit, p.fastFine, p.fastEditStrength);
     fclose(f);
     WriteDiagFlagFile(p.diagLogOn);
     Log("菜单: 已保存设置 → %s", path.c_str());
@@ -3566,6 +3662,13 @@ static bool LoadParamsFromFile(Params& p) {   // 只覆盖文件里出现的键
         else if (!strcmp(k, "hdr_white_scale")) p.hdrWhiteScale = std::clamp(fv, 0.1f, 8.0f);
         else if (!strcmp(k, "hdr_pq_white_nits")) p.hdrPqWhiteNits = std::clamp(fv, 80.0f, 1000.0f);
         else if (!strcmp(k, "hdr_chroma_clamp")) p.hdrChromaClamp = std::clamp(fv, 0.0f, 1.0f);
+        else if (!strcmp(k, "fast_on")) p.fastOn = (iv != 0);
+        else if (!strcmp(k, "fast_method")) p.fastMethod = std::clamp(iv, 0, 4);
+        else if (!strcmp(k, "fast_passes")) p.fastPasses = std::clamp(fv, 0.5f, 8.0f);
+        else if (!strcmp(k, "fast_il_passes")) p.fastIlPasses = std::clamp(iv, 2, 8);
+        else if (!strcmp(k, "fast_halo_limit")) p.fastHaloLimit = (iv != 0);
+        else if (!strcmp(k, "fast_fine")) p.fastFine = std::clamp(fv, 0.0f, 3.0f);
+        else if (!strcmp(k, "fast_edit_strength")) p.fastEditStrength = std::clamp(fv, 0.0f, 4.0f);
         else continue;
         ++n;
     }
@@ -9438,6 +9541,7 @@ static bool RebuildNetResolution(UINT wantW, UINT wantH, ID3D12Resource* color,
     g_worker.color.Reset(); g_worker.colorFp16.Reset(); g_worker.vel.Reset();
     g_worker.up.Reset(); g_worker.upPtr = nullptr;
     g_worker.bMvZeroUp.Reset(); g_worker.rbPriv.Reset(); g_worker.bytesPriv = 0;
+    g_fastEngine.Reset();
 
     kNetW = wantW; kNetH = wantH;
     ++g_buildGen;
@@ -11741,20 +11845,35 @@ static bool ProxyImGuiInit() {
         ImGuiIO& io = ImGui::GetIO();
         io.IniFilename = nullptr;
         // 中文字体：默认字体没有汉字，必须从系统字体加载（失败则回退默认字体）
+        // 扩展完整简繁体常用汉字 + 制表符(═) + 箭头(→) + CJK标点/全角字符，避免部分汉字（如 曝/抑/频/敛/预/帧/渲）与符号显示成 ?
         {
+            static const ImWchar kMenuGlyphRanges[] = {
+                0x0020, 0x00FF, // Basic Latin + Latin Supplement (· × 等)
+                0x2000, 0x206F, // General Punctuation (— … 等)
+                0x2190, 0x21FF, // Arrows (→ 等)
+                0x2500, 0x257F, // Box Drawing (═ 等)
+                0x25A0, 0x26FF, // Geometric Shapes + Misc Symbols (★ 等)
+                0x3000, 0x30FF, // CJK Symbols & Punctuation (【 】 「 」 、 。 等)
+                0x4E00, 0x9FFF, // Complete CJK Unified Ideographs
+                0xFF00, 0xFFEF, // Halfwidth & Fullwidth Forms (（ ： 等)
+                0,
+            };
             const char* cands[] = {
                 "C:\\Windows\\Fonts\\msyh.ttc",  "C:\\Windows\\Fonts\\msyhbd.ttc",
                 "C:\\Windows\\Fonts\\simhei.ttf","C:\\Windows\\Fonts\\simsun.ttc",
                 "C:\\Windows\\Fonts\\Deng.ttf"
             };
+            io.Fonts->TexDesiredWidth = 4096;
             bool fontOk = false;
             for (const char* p : cands) {
                 if (GetFileAttributesA(p) == INVALID_FILE_ATTRIBUTES) continue;
-                if (io.Fonts->AddFontFromFileTTF(p, 20.0f, nullptr,
-                        io.Fonts->GetGlyphRangesChineseSimplifiedCommon())) { fontOk = true; break; }
+                if (io.Fonts->AddFontFromFileTTF(p, 20.0f, nullptr, kMenuGlyphRanges)) {
+                    fontOk = true;
+                    break;
+                }
             }
             if (!fontOk) { io.Fonts->AddFontDefault(); Log("ImGui: 未找到中文字体，回退默认字体"); }
-            else Log("ImGui: 中文字体已加载");
+            else Log("ImGui: 中文字体已加载（完整汉字与符号字库）");
         }
         io.LogFilename = nullptr;
         io.DisplaySize = ImVec2((float)g_outW, (float)g_outH);
@@ -11977,6 +12096,55 @@ static void MenuSectionRuntimeForm() {
     ImGui::TextDisabled(diagOn ? "日志: 开启中" : "日志: 已关闭（零写盘）");
     ImGui::Separator();
 }
+static void MenuSectionFastPasses() {
+    ImGui::TextDisabled("════ 多遍快速叠层 (Passes fast · 移植自 mochizuki 0.0.9) ════");
+    if (!g_backendNgx) {
+        ImGui::TextDisabled("提示: 当前后端未切到 NGX (dlssnr_core)，切换为 ngx 后生效");
+    }
+    ImGui::Checkbox("启用多遍叠层 (Passes fast · 神经卡单遍推理等效多遍)", &g_fastOn);
+    ImGui::SetItemTooltip("无需重复跑多遍神经网络：通过空间导向过滤 / 时域特征回注 / 交错累积，在单遍推理代价下等效 2~8 遍 DLSS5 叠层；开启后核心统一切到 RGBA16F，A/B 双形态及 SDR/HDR 全模式共用");
+    if (g_fastOn) {
+        int fm = std::clamp(g_fastMethod, 0, 4);
+        if (ImGui::Combo("叠层方法 (Method)", &fm,
+                         "0 Interleaved (时间交错积累 · N帧等效N遍)\0"
+                         "1 Extrapolation (零帧延迟空间外推 · 无历史拖影)\0"
+                         "2 Feedback (低频导向系数反馈)\0"
+                         "3 Hybrid (Feedback + Extrapolation · 动态最稳)\0"
+                         "4 Edit strength (直接缩放网络编辑量)\0")) {
+            g_fastMethod = fm;
+        }
+        ImGui::SetItemTooltip(
+            "Interleaved: 把当前帧切分到 N 个子阶段跨帧交错喂入核心并累积（推荐静态/慢速镜头与高频纹理）\n"
+            "Extrapolation: 只用空间导向滤波把核心变化率外推到 Passes 倍（无运动重影）\n"
+            "Feedback: 把上一遍过滤后的导向系数按运动矢量注回本帧输入\n"
+            "Hybrid: 先 Feedback 再做空间外推，兼顾响应与稳定\n"
+            "Edit strength: 用线性/伽马空间系数直接倍增网络输出与输入的差值");
+        if (g_fastMethod == 0) {
+            ImGui::SliderInt("交错槽位数 (Interleaved Passes)", &g_fastIlPasses, 2, 8, "%d 遍");
+            ImGui::SetItemTooltip("2~8 遍；越大细节收敛越深，预热期需 N 帧填满全槽位");
+        } else if (g_fastMethod == 4) {
+            ImGui::SliderFloat("编辑倍率 (Edit strength)", &g_fastEditStrength, 0.0f, 4.0f, "%.2fx");
+            ImGui::SetItemTooltip("1.00 = 原生 1 遍；2.00 = 双倍编辑幅度；>1 可继续强化或去噪");
+        } else {
+            ImGui::SliderFloat("等效遍数 (Passes)", &g_fastPasses, 0.5f, 8.0f, "%.1f 遍");
+            ImGui::SetItemTooltip("目标等效叠层遍数（默认 3.0 遍；Feedback 时 1 遍无反馈）");
+            ImGui::Checkbox("光晕抑制 (Halo limit)", &g_fastHaloLimit);
+            ImGui::SameLine();
+            ImGui::SliderFloat("高频保护 (Fine)", &g_fastFine, 0.0f, 3.0f, "%.2f");
+            ImGui::SetItemTooltip("调节高频残差外推 / 反馈权重，压低强对比边缘光晕");
+        }
+        static const char* kMethodNames[] = { "Interleaved", "Extrapolation", "Feedback", "Hybrid", "Edit strength" };
+        const int eff = g_fastEffMethod;
+        if (eff >= 0 && eff <= 4) {
+            ImGui::TextDisabled("实时状态: %s%s",
+                                kMethodNames[eff],
+                                g_fastNeutralLive ? " | 已启用中性核心接管 (Style/Intensity 在累积阶段生效)" : "");
+        } else {
+            ImGui::TextDisabled("实时状态: 待命（等待下帧 NGX Eval 激活，Passes=1.0 时 Feedback 旁路）");
+        }
+    }
+    ImGui::Separator();
+}
 static void ProxyImGuiDraw(ID3D12GraphicsCommandList* cl, ID3D12Resource* rt, bool wmEligible,
                            D3D12_RESOURCE_STATES outputState) {
     if (!g_imguiInited || g_imguiFail || !rt) { return; }
@@ -12026,6 +12194,7 @@ static void ProxyImGuiDraw(ID3D12GraphicsCommandList* cl, ID3D12Resource* rt, bo
         MenuSectionNetwork009();
         MenuSectionNrControls();
         MenuSectionPreprocess();
+        MenuSectionFastPasses();
         MenuSectionHdr();
 
         ImGui::Separator();
