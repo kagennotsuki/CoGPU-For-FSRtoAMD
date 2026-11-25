@@ -631,13 +631,14 @@ struct Capabilities {   // LmxxfNrCapabilities
 
 static UINT kNetW = 1920, kNetH = 1080;
 static inline UINT64 AnsBytes() { return (UINT64)kNetW * (UINT64)kNetH * 4ull; }
-static volatile int  g_nrScaleMode = 0;      // 0=1080p, 1=50%, 2=67%, 3=75%, 4=100%, 5=720p, 6=900p, 7=1440p
+static volatile int  g_nrScaleMode = 0;      // 0=1080p, 1=50%, 2=67%, 3=75%, 4=100%, 5=720p, 6=900p, 7=1440p, 8=4K(2160p)
 static std::atomic<bool> g_netRebuilding{false};
 static void ComputeNetDims(int mode, UINT refW, UINT refH, UINT& outW, UINT& outH) {
     switch (mode) {
     case 5: outW = 1280; outH = 720; return;
     case 6: outW = 1600; outH = 900; return;
     case 7: outW = 2560; outH = 1440; return;
+    case 8: outW = 3840; outH = 2160; return;
     case 1: case 2: case 3: case 4: {
         if (refW < 320 || refH < 180) { refW = 1920; refH = 1080; }
         static const float kPct[4] = { 0.50f, 0.6667f, 0.75f, 1.00f };
@@ -646,8 +647,8 @@ static void ComputeNetDims(int mode, UINT refW, UINT refH, UINT& outW, UINT& out
         UINT rh = (UINT)lroundf((float)refH * sc);
         rw = ((rw + 32u) / 64u) * 64u;
         rh = ((rh + 4u) / 8u) * 8u;
-        if (rw < 640u)  rw = 640u;  if (rw > 2560u) rw = 2560u;
-        if (rh < 360u)  rh = 360u;  if (rh > 1440u) rh = 1440u;
+        if (rw < 640u)  rw = 640u;  if (rw > 3840u) rw = 3840u;
+        if (rh < 360u)  rh = 360u;  if (rh > 2160u) rh = 2160u;
         outW = rw; outH = rh; return;
     }
     default: outW = 1920; outH = 1080; return;
@@ -3534,7 +3535,7 @@ static void ApplyParams(const Params& p) {
     g_ppCurve = p.ppCurve; g_ppContrast = p.ppContrast; g_ppSat = p.ppSat;
     g_ppLoaded = true;
     if (ppChanged) SavePreprocessToIni();
-    g_nrScaleMode = (p.nrScaleMode >= 0 && p.nrScaleMode <= 7) ? p.nrScaleMode : 0;
+    g_nrScaleMode = (p.nrScaleMode >= 0 && p.nrScaleMode <= 8) ? p.nrScaleMode : 0;
     if ((g_diagLogOn != 0) != p.diagLogOn) {
         SetDiagLogEnabled(p.diagLogOn, true, "参数应用");
     }
@@ -3654,7 +3655,7 @@ static bool LoadParamsFromFile(Params& p) {   // 只覆盖文件里出现的键
         else if (!strcmp(k, "pp_curve")) p.ppCurve = (iv >= 0 && iv < 7) ? iv : 3;
         else if (!strcmp(k, "pp_contrast")) p.ppContrast = fv;
         else if (!strcmp(k, "pp_saturation")) p.ppSat = fv;
-        else if (!strcmp(k, "nr_scale_mode")) p.nrScaleMode = (iv >= 0 && iv <= 7) ? iv : 0;
+        else if (!strcmp(k, "nr_scale_mode")) p.nrScaleMode = (iv >= 0 && iv <= 8) ? iv : 0;
         else if (!strcmp(k, "diag_log")) { if (allowIniDiagLog) p.diagLogOn = (iv != 0); }
         else if (!strcmp(k, "hdr_override")) p.hdrOverride = (iv >= 0 && iv <= 3) ? iv : 0;
         else if (!strcmp(k, "hdr_curve")) p.hdrCurve = (iv >= 0 && iv <= 1) ? iv : 0;
@@ -11932,7 +11933,7 @@ static void MenuSectionNrControls() {
     ImGui::Separator();
     ImGui::TextDisabled("════ NR 推理分辨率倍率 (NR Scale · 移植自 mochizuki) ════");
     int sm = (int)g_nrScaleMode;
-    if (sm < 0 || sm > 7) sm = 0;
+    if (sm < 0 || sm > 8) sm = 0;
     if (ImGui::Combo("推理尺寸档位 (NR Scale)", &sm,
                      "0 固定 1080p (1920x1080 · 默认经典)\0"
                      "1 50% 渲染分辨率\0"
@@ -11941,7 +11942,8 @@ static void MenuSectionNrControls() {
                      "4 100% 渲染分辨率 (原生 1:1)\0"
                      "5 固定 720p (1280x720 · 高帧率)\0"
                      "6 固定 900p (1600x900 · 均衡)\0"
-                     "7 固定 1440p (2560x1440 · 高精细)\0")) {
+                     "7 固定 1440p (2560x1440 · 高精细)\0"
+                     "8 固定 4K (3840x2160 · 极致画质)\0")) {
         g_nrScaleMode = sm;
         Log("菜单(NR Scale): 请求切换档位 %d", sm);
     }

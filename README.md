@@ -26,7 +26,7 @@
   - **A 形态（由【游戏卡】负责呈现最终画面 · A3 同帧合成 + 超分）**：主卡采集 Color / MV / Depth 传给副卡推理，答案回传后在同帧资源与真实超分器内合成并由游戏主卡直接呈现（副卡来不及出新帧时在缓存窗内平滑复用最近完成帧）。
   - **B 形态（由【神经卡】负责呈现最终画面 · 4K 后置 DComp 覆盖 + 直连抓帧）**：主 SwapChain 提交前直连抓取 `PRESENT` 后缓冲送副卡完成合成，最终画面由神经卡经独立 DComp 透明覆盖层呈现（`Del` 菜单顶部实时显示当前运行形态与呈现显卡，支持一键切换）。
 - **可热切换 NR 推理分辨率倍率（NR Scale · 移植自 mochizuki）**：
-  - 支持在 `Del` 菜单内直接切换 `固定 1080p`、`50% / 67% / 75% / 100% 渲染分辨率`、`固定 720p / 900p / 1440p` 共 8 档（默认保持经典 `1080p`），自动安全排空双卡队列并重建跨卡共享资源与 0.0.9 会话（`F7 / F8` 跑马灯与三横带诊断已在 A/B 双形态统一关闭）。
+  - 支持在 `Del` 菜单内直接切换 `固定 1080p`、`50% / 67% / 75% / 100% 渲染分辨率`、`固定 720p / 900p / 1440p / 4K (3840x2160)` 共 9 档（默认保持经典 `1080p`），自动安全排空双卡队列并重建跨卡共享资源与 0.0.9 会话（`F7 / F8` 跑马灯与三横带诊断已在 A/B 双形态统一关闭）。
 - **GPU 预处理实装（`[Preprocess]`）**：
   - 在 `DownCS` / `kBformDS` 计算着色器内直接支持预处理总开关、曝光增益（EV Bias）、色调曲线（`none / neutral / reinhard / filmic / gt / aces / agx`）、中灰对比度与饱和度调节，并同步 `dlssnr-amd.ini` 与 `xess_proxy.saved.ini`。
 - **完整 HDR10 PQ / scRGB 管线支持（A & B 双形态）**：
@@ -123,9 +123,9 @@ powershell -ExecutionPolicy Bypass -File .\scripts\build_ffx_proxy.ps1
 
 | 文件 | 大小 (Bytes) | SHA256 |
 |---|---:|---|
-| `prebuilt/OptiScaler/plugins/cogpu_nr.asi` | `1,228,288` | `0C05018D45871F17965B6DDEE5E7EEAFF3E07C0736B8754F95DD9AB210E3FF54` |
+| `prebuilt/OptiScaler/plugins/cogpu_nr.asi` | `1,228,800` | `C506C71C6868AC93BB796F14C789201032E3B720197A9B3632088930AC6E42D8` |
 | `prebuilt/dlssnr_core.dll` | `6,035,547` | `89CBA727B4440EA99F74354DB866285C3498044DFB43EF8E905EF4ECAF617642` |
-| `prebuilt/standalone_ffx_proxy/amd_fidelityfx_upscaler_dx12.dll` | `1,197,568` | `DB7D2DDC6E1FE141FE8D6FF43EBE4C9F40655F954A12E2AAD0CF590ECEAD469D` |
+| `prebuilt/standalone_ffx_proxy/amd_fidelityfx_upscaler_dx12.dll` | `1,197,568` | `A9D04C2FBB0C40FDE582BCE194C0517C784C7193D7B1F7EE3B5CA108D24A43CB` |
 
 ---
 
