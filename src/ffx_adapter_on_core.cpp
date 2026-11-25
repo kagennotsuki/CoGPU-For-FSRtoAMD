@@ -48,13 +48,29 @@ static void EnsureDir() {
     char* s = strrchr(g_dir, '\\'); if (s) s[1] = 0;
 }
 
+extern "C" int CoreDiagLogEnabled();
+static FILE* g_ffxLog = nullptr;
+static SRWLOCK g_ffxLogLock = SRWLOCK_INIT;
+
 static void Logf(const char* fmt, ...) {
-    static FILE* f = nullptr;
-    static bool init = false;
-    if (!init) { init = true; EnsureDir(); char p[MAX_PATH]; lstrcpyA(p, g_dir); lstrcatA(p, "ffx_on_core.log"); fopen_s(&f, p, "w"); }
-    if (!f) return;
-    va_list ap; va_start(ap, fmt); vfprintf(f, fmt, ap); va_end(ap);
-    fputc('\n', f); fflush(f);
+    const bool enabled = (CoreDiagLogEnabled() != 0);
+    if (!enabled && !g_ffxLog) return;
+    AcquireSRWLockExclusive(&g_ffxLogLock);
+    if (!CoreDiagLogEnabled()) {
+        if (g_ffxLog) { fclose(g_ffxLog); g_ffxLog = nullptr; }
+        ReleaseSRWLockExclusive(&g_ffxLogLock);
+        return;
+    }
+    if (!g_ffxLog) {
+        EnsureDir();
+        char p[MAX_PATH]; lstrcpyA(p, g_dir); lstrcatA(p, "ffx_on_core.log");
+        g_ffxLog = _fsopen(p, "w", _SH_DENYNO);
+    }
+    if (g_ffxLog) {
+        va_list ap; va_start(ap, fmt); vfprintf(g_ffxLog, fmt, ap); va_end(ap);
+        fputc('\n', g_ffxLog); fflush(g_ffxLog);
+    }
+    ReleaseSRWLockExclusive(&g_ffxLogLock);
 }
 
 struct RealFfx {

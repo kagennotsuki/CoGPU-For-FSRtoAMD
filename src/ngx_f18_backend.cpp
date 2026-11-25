@@ -26,14 +26,33 @@
 #include <string>
 
 // ------------------------------------------------------------------ logging (next to our module)
+extern "C" int CoreDiagLogEnabled();
 static FILE* g_log = nullptr;
+static SRWLOCK g_ngxLogLock = SRWLOCK_INIT;
+static std::string NgxDir();
+static void NgxLogOpenLocked() {
+    if (g_log) return;
+    std::string p = NgxDir() + "ngx_backend.log";
+    g_log = _fsopen(p.c_str(), "w", _SH_DENYNO);
+}
 static void NgxLog(const char* fmt, ...) {
-    if (!g_log) return;
-    va_list ap; va_start(ap, fmt);
-    vfprintf(g_log, fmt, ap);
-    va_end(ap);
-    fputc('\n', g_log);
-    fflush(g_log);
+    const bool enabled = (CoreDiagLogEnabled() != 0);
+    if (!enabled && !g_log) return;
+    AcquireSRWLockExclusive(&g_ngxLogLock);
+    if (!CoreDiagLogEnabled()) {
+        if (g_log) { fclose(g_log); g_log = nullptr; }
+        ReleaseSRWLockExclusive(&g_ngxLogLock);
+        return;
+    }
+    if (!g_log) NgxLogOpenLocked();
+    if (g_log) {
+        va_list ap; va_start(ap, fmt);
+        vfprintf(g_log, fmt, ap);
+        va_end(ap);
+        fputc('\n', g_log);
+        fflush(g_log);
+    }
+    ReleaseSRWLockExclusive(&g_ngxLogLock);
 }
 static std::string ExeDir() {
     char p[MAX_PATH] = { 0 };
@@ -55,9 +74,10 @@ static std::string NgxDir() {
 #endif
 }
 static void NgxLogOpen() {
-    if (g_log) return;
-    std::string p = NgxDir() + "ngx_backend.log";
-    fopen_s(&g_log, p.c_str(), "w");
+    if (!CoreDiagLogEnabled()) return;
+    AcquireSRWLockExclusive(&g_ngxLogLock);
+    NgxLogOpenLocked();
+    ReleaseSRWLockExclusive(&g_ngxLogLock);
 }
 
 // ------------------------------------------------------------------ NGX parameter block (17 slots)

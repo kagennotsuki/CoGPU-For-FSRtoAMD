@@ -109,11 +109,133 @@ static volatile int   g_debugView = 0;            // 0=正常 1=代理 2=纯网�
 static volatile bool  g_bypass = false;           // 直出运行时输出（配合 debug_view 使用）
 
 static std::mutex g_logMtx;   // ★ Log 可能被多个线程（渲染/Present/worker）调用
+static volatile LONG g_diagLogOn = 0;   // 默认关闭所有写日志动作；1=开启诊断日志（菜单一键 / xess_proxy.log.txt / saved.ini）
+extern "C" int CoreDiagLogEnabled() { return g_diagLogOn ? 1 : 0; }
+
+static constexpr size_t kLogMaxBytes         = 20u * 1024u * 1024u;
+static constexpr size_t kLogCompactThreshold = 19u * 1024u * 1024u;
+static constexpr size_t kLogHeadKeep         = 64u * 1024u;
+static constexpr size_t kLogTailKeep         = 10u * 1024u * 1024u;
+static size_t           g_logBytes           = 0;
+static std::string      g_logPath;
+static unsigned char    g_logCopyBuf[256u * 1024u];   // 仅在 g_logMtx 内且超过 19MB 时使用，零堆分配
+static FILETIME         g_logCfgFt           = {};
+static bool             g_logCfgHasFile      = false;
+
+static std::string ModuleDir();
+
+// ★ 体积上限控制：文件达到 ~19MB（严守 <= 20MB）时就地流式裁剪，
+//   保留启动头部 ~64KB + 最新 ~10MB（零堆分配、不Overlap、仅每次~9MB触发一次）
+static void CompactLogLocked() {
+    if (g_logPath.empty()) return;
+    if (g_log) { fclose(g_log); g_log = nullptr; }
+
+    HANDLE h = CreateFileA(g_logPath.c_str(), GENERIC_READ | GENERIC_WRITE,
+                           FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
+                           OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h != INVALID_HANDLE_VALUE) {
+        LARGE_INTEGER fsz{};
+        if (GetFileSizeEx(h, &fsz) && fsz.QuadPart >= (LONGLONG)kLogCompactThreshold) {
+            DWORD headWant = (DWORD)((fsz.QuadPart < (LONGLONG)kLogHeadKeep) ? fsz.QuadPart : (LONGLONG)kLogHeadKeep);
+            if (headWant > sizeof(g_logCopyBuf)) headWant = sizeof(g_logCopyBuf);
+            DWORD headGot = 0;
+            LARGE_INTEGER zero{};
+            SetFilePointerEx(h, zero, nullptr, FILE_BEGIN);
+            ReadFile(h, g_logCopyBuf, headWant, &headGot, nullptr);
+            LONGLONG headEnd = (LONGLONG)headGot;
+            for (LONGLONG i = (LONGLONG)headGot - 1; i >= 0; --i) {
+                if (g_logCopyBuf[i] == '\n') { headEnd = i + 1; break; }
+            }
+
+            static const char kTrimMarker[] =
+                "\r\n===== [xess_proxy.log] 旧日志已裁剪（保留启动前 64KB + 最新约 10MB，上限 20MB）=====\r\n";
+            const LONGLONG markerLen = (LONGLONG)(sizeof(kTrimMarker) - 1);
+
+            LONGLONG tailStart = fsz.QuadPart - (LONGLONG)kLogTailKeep;
+            if (tailStart < headEnd + markerLen) tailStart = headEnd + markerLen;
+            if (tailStart < fsz.QuadPart) {
+                DWORD probeWant = (DWORD)((fsz.QuadPart - tailStart) > 4096 ? 4096 : (fsz.QuadPart - tailStart));
+                LARGE_INTEGER liProbe; liProbe.QuadPart = tailStart;
+                DWORD probeGot = 0;
+                if (SetFilePointerEx(h, liProbe, nullptr, FILE_BEGIN) &&
+                    ReadFile(h, g_logCopyBuf, probeWant, &probeGot, nullptr)) {
+                    for (DWORD i = 0; i < probeGot; ++i) {
+                        if (g_logCopyBuf[i] == '\n') { tailStart += (LONGLONG)(i + 1); break; }
+                    }
+                }
+            }
+            if (tailStart > fsz.QuadPart) tailStart = fsz.QuadPart;
+
+            // 先写裁剪分隔标记（headEnd + markerLen << tailStart，永不覆盖 tail 区域）
+            LARGE_INTEGER liHead; liHead.QuadPart = headEnd;
+            DWORD markerWrote = 0;
+            SetFilePointerEx(h, liHead, nullptr, FILE_BEGIN);
+            WriteFile(h, kTrimMarker, (DWORD)markerLen, &markerWrote, nullptr);
+
+            LONGLONG rPos = tailStart;
+            LONGLONG wPos = headEnd + (LONGLONG)markerWrote;
+            if (rPos > wPos) {
+                while (rPos < fsz.QuadPart) {
+                    DWORD chunk = (DWORD)((fsz.QuadPart - rPos) > (LONGLONG)sizeof(g_logCopyBuf)
+                                          ? sizeof(g_logCopyBuf) : (fsz.QuadPart - rPos));
+                    LARGE_INTEGER liR; liR.QuadPart = rPos;
+                    if (!SetFilePointerEx(h, liR, nullptr, FILE_BEGIN)) break;
+                    DWORD got = 0;
+                    if (!ReadFile(h, g_logCopyBuf, chunk, &got, nullptr) || got == 0) break;
+                    LARGE_INTEGER liW; liW.QuadPart = wPos;
+                    if (!SetFilePointerEx(h, liW, nullptr, FILE_BEGIN)) break;
+                    DWORD wrote = 0;
+                    if (!WriteFile(h, g_logCopyBuf, got, &wrote, nullptr) || wrote != got) break;
+                    rPos += (LONGLONG)got;
+                    wPos += (LONGLONG)wrote;
+                }
+            } else {
+                wPos = fsz.QuadPart;
+            }
+            LARGE_INTEGER liEnd; liEnd.QuadPart = wPos;
+            SetFilePointerEx(h, liEnd, nullptr, FILE_BEGIN);
+            SetEndOfFile(h);
+            g_logBytes = (size_t)wPos;
+        } else if (fsz.QuadPart >= 0) {
+            g_logBytes = (size_t)fsz.QuadPart;
+        }
+        CloseHandle(h);
+    }
+
+    g_log = _fsopen(g_logPath.c_str(), "a", _SH_DENYNO);
+}
+
+static void OpenLogLocked(bool appendMode) {
+    if (g_log) return;
+    if (g_logPath.empty()) g_logPath = ModuleDir() + "xess_proxy.log";
+    if (appendMode) {
+        WIN32_FILE_ATTRIBUTE_DATA fad{};
+        if (GetFileAttributesExA(g_logPath.c_str(), GetFileExInfoStandard, &fad)) {
+            ULONGLONG sz = ((ULONGLONG)fad.nFileSizeHigh << 32) | fad.nFileSizeLow;
+            if (sz >= kLogCompactThreshold) CompactLogLocked();
+            else g_logBytes = (size_t)sz;
+        } else {
+            g_logBytes = 0;
+        }
+    } else {
+        g_logBytes = 0;
+    }
+    if (!g_log) g_log = _fsopen(g_logPath.c_str(), appendMode ? "a" : "w", _SH_DENYNO);
+}
+
 static void Log(const char* fmt, ...) {
+    if (!g_diagLogOn) return;
     std::lock_guard<std::mutex> lk(g_logMtx);
+    if (!g_diagLogOn) return;
+    if (!g_log) OpenLogLocked(true);
     if (!g_log) return;
-    va_list ap; va_start(ap, fmt); vfprintf(g_log, fmt, ap); va_end(ap);
-    fputc('\n', g_log); fflush(g_log);
+    va_list ap; va_start(ap, fmt);
+    int nw = vfprintf(g_log, fmt, ap);
+    va_end(ap);
+    if (nw > 0) g_logBytes += (size_t)nw;
+    if (fputc('\n', g_log) != EOF) g_logBytes += 2;   // 按 CRLF 文本模式保守计入 2 字节，确保物理体积严格低于 20MB
+    fflush(g_log);
+    if (g_logBytes >= kLogCompactThreshold) CompactLogLocked();
 }
 
 // BTRACE1 的发射者只有启动时的 SESSION 和之后的 HotkeyThread。
@@ -121,15 +243,23 @@ static void Log(const char* fmt, ...) {
 static char g_btLogBatch[(BTRACE1_FLUSH_BATCH + 2) * BTRACE1_REC_MAX];
 static size_t g_btLogUsed = 0;
 static void FlushBtLogBatch() {
+    if (!g_diagLogOn) { g_btLogUsed = 0; return; }
     if (!g_btLogUsed) return;
     std::lock_guard<std::mutex> lk(g_logMtx);
-    if (g_log) {
-        fwrite(g_btLogBatch, 1, g_btLogUsed, g_log);
-        fflush(g_log);
+    if (g_diagLogOn) {
+        if (!g_log) OpenLogLocked(true);
+        if (g_log) {
+            size_t wrote = fwrite(g_btLogBatch, 1, g_btLogUsed, g_log);
+            fflush(g_log);
+            // Text mode appends CR for every LF; count generously so physical size stays <= 20MB.
+            g_logBytes += wrote + (wrote / 32u) + 32u;
+            if (g_logBytes >= kLogCompactThreshold) CompactLogLocked();
+        }
     }
     g_btLogUsed = 0;
 }
 static void StageBtLogLine(const char* line) {
+    if (!g_diagLogOn) return;
     const size_t bytes = strlen(line);
     if (bytes >= sizeof(g_btLogBatch)) { FlushBtLogBatch(); Log("%s", line); return; }
     if (bytes + 1 > sizeof(g_btLogBatch) - g_btLogUsed) FlushBtLogBatch();
@@ -150,9 +280,133 @@ static std::string ModuleDir() {
     return (q == std::string::npos) ? std::string() : s.substr(0, q + 1);
 }
 static void OpenLog() {
-    if (g_log) return;
-    std::string s = ModuleDir() + "xess_proxy.log";
-    g_log = _fsopen(s.c_str(), "w", _SH_DENYNO);
+    std::lock_guard<std::mutex> lk(g_logMtx);
+    OpenLogLocked(false);
+}
+
+static bool ReadDiagFlagFile(const std::string& path, bool& outOn, FILETIME& outFt) {
+    WIN32_FILE_ATTRIBUTE_DATA fad{};
+    if (!GetFileAttributesExA(path.c_str(), GetFileExInfoStandard, &fad)) return false;
+    outFt = fad.ftLastWriteTime;
+    FILE* f = _fsopen(path.c_str(), "rb", _SH_DENYNO);
+    if (!f) return false;
+    char buf[64] = { 0 };
+    size_t n = fread(buf, 1, sizeof(buf) - 1, f);
+    fclose(f);
+    buf[n] = '\0';
+    unsigned char* u = (unsigned char*)buf;
+    if (n >= 3 && u[0] == 0xEF && u[1] == 0xBB && u[2] == 0xBF) u += 3;
+    while (*u == ' ' || *u == '\t' || *u == '\r' || *u == '\n') ++u;
+    outOn = (*u != '\0') && (atoi((const char*)u) != 0 ||
+                             _strnicmp((const char*)u, "on", 2) == 0 ||
+                             _strnicmp((const char*)u, "true", 4) == 0);
+    return true;
+}
+
+static void WriteDiagFlagFile(bool on) {
+    std::string path = ModuleDir() + "xess_proxy.log.txt";
+    FILE* f = _fsopen(path.c_str(), "w", _SH_DENYNO);
+    if (f) {
+        fprintf(f, "%d\n", on ? 1 : 0);
+        fclose(f);
+    }
+    WIN32_FILE_ATTRIBUTE_DATA fad{};
+    if (GetFileAttributesExA(path.c_str(), GetFileExInfoStandard, &fad)) {
+        g_logCfgFt = fad.ftLastWriteTime;
+        g_logCfgHasFile = true;
+    }
+}
+
+static bool ReadSavedIniDiagFlag(bool& outOn, FILETIME& outFt) {
+    std::string path = ModuleDir() + "xess_proxy.saved.ini";
+    WIN32_FILE_ATTRIBUTE_DATA fad{};
+    if (!GetFileAttributesExA(path.c_str(), GetFileExInfoStandard, &fad)) return false;
+    outFt = fad.ftLastWriteTime;
+    FILE* f = _fsopen(path.c_str(), "rb", _SH_DENYNO);
+    if (!f) return false;
+    char line[256];
+    bool found = false;
+    while (fgets(line, sizeof(line), f)) {
+        char* eq = strchr(line, '=');
+        if (!eq) continue;
+        *eq = '\0';
+        char* k = line;
+        while (*k == ' ' || *k == '\t') ++k;
+        if (!strcmp(k, "diag_log")) {
+            outOn = (atoi(eq + 1) != 0);
+            found = true;
+        }
+    }
+    fclose(f);
+    return found;
+}
+
+static void SetDiagLogEnabled(bool on, bool persistFlagFile, const char* reason, bool freshTruncate = false) {
+    const bool prev = (g_diagLogOn != 0);
+    if (persistFlagFile) WriteDiagFlagFile(on);
+    if (on) {
+        {
+            std::lock_guard<std::mutex> lk(g_logMtx);
+            InterlockedExchange(&g_diagLogOn, 1L);
+            OpenLogLocked(!freshTruncate);
+        }
+        if (!prev || freshTruncate) {
+            Log("=== 诊断日志已开启（%s · 体积上限 20MB）===", reason ? reason : "manual");
+        }
+    } else {
+        if (prev) Log("=== 诊断日志已关闭（%s）===", reason ? reason : "manual");
+        InterlockedExchange(&g_diagLogOn, 0L);
+        std::lock_guard<std::mutex> lk(g_logMtx);
+        g_btLogUsed = 0;
+        if (g_log) { fclose(g_log); g_log = nullptr; }
+        g_logBytes = 0;
+    }
+}
+
+static void DiagLogInit() {
+    std::string cfgPath = ModuleDir() + "xess_proxy.log.txt";
+    bool cfgOn = false, iniOn = false;
+    FILETIME cfgFt{}, iniFt{};
+    const bool hasCfg = ReadDiagFlagFile(cfgPath, cfgOn, cfgFt);
+    const bool hasIni = ReadSavedIniDiagFlag(iniOn, iniFt);
+    if (hasCfg) { g_logCfgFt = cfgFt; g_logCfgHasFile = true; }
+
+    bool startOn = false;
+    const char* src = "默认关闭";
+    if (hasCfg && hasIni) {
+        if (CompareFileTime(&iniFt, &cfgFt) > 0) { startOn = iniOn; src = "xess_proxy.saved.ini"; }
+        else { startOn = cfgOn; src = "xess_proxy.log.txt"; }
+    } else if (hasCfg) {
+        startOn = cfgOn; src = "xess_proxy.log.txt";
+    } else if (hasIni) {
+        startOn = iniOn; src = "xess_proxy.saved.ini";
+    }
+    SetDiagLogEnabled(startOn, false, src, true /*freshTruncate*/);
+}
+
+static void DiagLogPollConfig() {
+    static ULONGLONG lastPoll = 0;
+    const ULONGLONG now = GetTickCount64();
+    if (now - lastPoll < 1000) return;
+    lastPoll = now;
+
+    std::string cfgPath = ModuleDir() + "xess_proxy.log.txt";
+    WIN32_FILE_ATTRIBUTE_DATA fad{};
+    if (!GetFileAttributesExA(cfgPath.c_str(), GetFileExInfoStandard, &fad)) {
+        g_logCfgHasFile = false;
+        return;
+    }
+    if (!g_logCfgHasFile || CompareFileTime(&fad.ftLastWriteTime, &g_logCfgFt) != 0) {
+        bool wantOn = false;
+        FILETIME ft{};
+        if (ReadDiagFlagFile(cfgPath, wantOn, ft)) {
+            g_logCfgFt = ft;
+            g_logCfgHasFile = true;
+            if (wantOn != (g_diagLogOn != 0)) {
+                SetDiagLogEnabled(wantOn, false, "xess_proxy.log.txt 热重载");
+            }
+        }
+    }
 }
 
 // ============ dlssnr-amd.ini 的 [Preprocess] 读写 ============
@@ -3068,6 +3322,7 @@ struct Params {
     int   ppExpMode, ppCurve;
     float ppBias, ppContrast, ppSat;
     int   nrScaleMode;
+    bool  diagLogOn;         // 诊断日志开关（默认关闭；与 xess_proxy.log.txt / 菜单同步）
 };
 static Params g_sessionStart{};
 static bool   g_sessionStartValid = false;
@@ -3088,6 +3343,7 @@ static Params CaptureParams() {
     p.ppOn = g_ppOn; p.ppExpMode = g_ppExpMode; p.ppBias = g_ppBias;
     p.ppCurve = g_ppCurve; p.ppContrast = g_ppContrast; p.ppSat = g_ppSat;
     p.nrScaleMode = g_nrScaleMode;
+    p.diagLogOn = (g_diagLogOn != 0);
     return p;
 }
 static void ApplyParams(const Params& p) {
@@ -3110,6 +3366,9 @@ static void ApplyParams(const Params& p) {
     g_ppLoaded = true;
     if (ppChanged) SavePreprocessToIni();
     g_nrScaleMode = (p.nrScaleMode >= 0 && p.nrScaleMode <= 7) ? p.nrScaleMode : 0;
+    if ((g_diagLogOn != 0) != p.diagLogOn) {
+        SetDiagLogEnabled(p.diagLogOn, true, "参数应用");
+    }
     g_ctrlDirty = true;
 }
 static Params FactoryParams() {
@@ -3126,6 +3385,7 @@ static Params FactoryParams() {
     p.ppOn = true; p.ppExpMode = 1; p.ppBias = 0.0f;
     p.ppCurve = 3; p.ppContrast = 1.0f; p.ppSat = 1.0f;
     p.nrScaleMode = 0;
+    p.diagLogOn = false;
     return p;
 }
 static bool SaveParamsToFile(const Params& p) {
@@ -3146,12 +3406,19 @@ static bool SaveParamsToFile(const Params& p) {
     fprintf(f, "pp_enabled=%d\npp_exposure=%d\npp_bias=%.6f\npp_curve=%d\npp_contrast=%.6f\npp_saturation=%.6f\n",
             (int)p.ppOn, p.ppExpMode, p.ppBias, p.ppCurve, p.ppContrast, p.ppSat);
     fprintf(f, "nr_scale_mode=%d\n", p.nrScaleMode);
+    fprintf(f, "diag_log=%d\n", (int)p.diagLogOn);
     fclose(f);
+    WriteDiagFlagFile(p.diagLogOn);
     Log("菜单: 已保存设置 → %s", path.c_str());
     return true;
 }
 static bool LoadParamsFromFile(Params& p) {   // 只覆盖文件里出现的键
     std::string path = ModuleDir() + "xess_proxy.saved.ini";
+    WIN32_FILE_ATTRIBUTE_DATA iniFad{}, cfgFad{};
+    const bool hasIniAttr = (GetFileAttributesExA(path.c_str(), GetFileExInfoStandard, &iniFad) != 0);
+    std::string cfgPath = ModuleDir() + "xess_proxy.log.txt";
+    const bool hasCfgAttr = (GetFileAttributesExA(cfgPath.c_str(), GetFileExInfoStandard, &cfgFad) != 0);
+    const bool allowIniDiagLog = !hasCfgAttr || (hasIniAttr && CompareFileTime(&iniFad.ftLastWriteTime, &cfgFad.ftLastWriteTime) > 0);
     FILE* f = nullptr;
     if (fopen_s(&f, path.c_str(), "r") != 0 || !f) { Log("菜单: 没有存档（%s）", path.c_str()); return false; }
     char line[256]; int n = 0;
@@ -3198,6 +3465,7 @@ static bool LoadParamsFromFile(Params& p) {   // 只覆盖文件里出现的键
         else if (!strcmp(k, "pp_contrast")) p.ppContrast = fv;
         else if (!strcmp(k, "pp_saturation")) p.ppSat = fv;
         else if (!strcmp(k, "nr_scale_mode")) p.nrScaleMode = (iv >= 0 && iv <= 7) ? iv : 0;
+        else if (!strcmp(k, "diag_log")) { if (allowIniDiagLog) p.diagLogOn = (iv != 0); }
         else continue;
         ++n;
     }
@@ -10722,6 +10990,13 @@ static void MenuSectionRuntimeForm() {
     ImGui::SetItemTooltip("A 形态：由游戏卡合成并呈现最终画面；B 形态：由神经卡合成并通过独立 DComp 覆盖层呈现最终画面（等效 F3）");
     ImGui::SameLine();
     ImGui::TextDisabled("也可直接按 F3 热切换（约 1 秒生效）");
+    bool diagOn = (g_diagLogOn != 0);
+    if (ImGui::Checkbox("启用诊断日志（排障时开启 · 上限 20MB）", &diagOn)) {
+        SetDiagLogEnabled(diagOn, true, "菜单一键开关");
+    }
+    ImGui::SetItemTooltip("正常游玩默认关闭（零磁盘 I/O）。排障时一键开启，写 xess_proxy.log / 适配层 / NGX 日志并自动控制在 20MB 内；也可编辑 xess_proxy.log.txt (0/1) 或 xess_proxy.saved.ini (diag_log=0/1)");
+    ImGui::SameLine();
+    ImGui::TextDisabled(diagOn ? "日志: 开启中" : "日志: 已关闭（零写盘）");
     ImGui::Separator();
 }
 static void ProxyImGuiDraw(ID3D12GraphicsCommandList* cl, ID3D12Resource* rt, bool wmEligible,
@@ -11709,6 +11984,7 @@ static DWORD WINAPI HotkeyThread(LPVOID) {
                 }
             }
         }
+        DiagLogPollConfig();
         BtFlush(BTRACE1_FLUSH_BATCH);
         FlushBtLogBatch();
         Sleep(40);
@@ -11731,10 +12007,11 @@ BOOL APIENTRY DllMain(HMODULE mod, DWORD reason, LPVOID lpvReserved) {
                 }
             }
         }
-        OpenLog();
+        BtSetEmit(StageBtLogLine);
+        BtSetEnabled(&g_diagLogOn);
+        DiagLogInit();
         Log("libxess proxy v9（方案 B：槽位队列 + 延迟呈现）attached");
         Log("D0-OBS: MV probe active (build 2077-BUI-G0OBS-v1-D0)");
-        BtSetEmit(StageBtLogLine);
         BtSession("2077-BUI-G0OBS-v1", 2, "3C1A78FB8944E240D0F666CA2C74A30D33DE6F57970DE215B56C6321DAD1A1F", "fence-r5");
         FlushBtLogBatch();   // 启动 SESSION 仍立即落盘
         // 模型倍率必须在最早期设好：运行时在建会话时读取并缓存，晚于它初始化再设无效

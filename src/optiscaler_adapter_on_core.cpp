@@ -127,8 +127,17 @@ static void EnsureBaseDir() {
     lstrcpynA(g_baseDir, p, MAX_PATH);
 }
 
+extern "C" int CoreDiagLogEnabled();
+
 static void Logf(const char* fmt, ...) {
+    const bool enabled = (CoreDiagLogEnabled() != 0);
+    if (!enabled && !g_log) return;
     AcquireSRWLockExclusive(&g_logLock);
+    if (!CoreDiagLogEnabled()) {
+        if (g_log) { fclose(g_log); g_log = nullptr; }
+        ReleaseSRWLockExclusive(&g_logLock);
+        return;
+    }
     if (!g_log) {
         EnsureBaseDir();
         if (g_baseDir[0]) {

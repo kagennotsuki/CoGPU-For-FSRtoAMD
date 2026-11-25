@@ -33,8 +33,11 @@ struct BtRing {
 
 static BtRing g_btRing;                                  // 单实例（本 .cpp 只 include 一次）
 static void (*g_btEmit)(const char* line) = nullptr;     // 刷盘回调：宿主注册到 Log()
+static volatile const LONG* g_btEnabled = nullptr;       // 宿主诊断日志开关（nullptr 或 *p==0 时完全静默零开销）
 
 static inline void BtSetEmit(void (*emit)(const char* line)) { g_btEmit = emit; }
+static inline void BtSetEnabled(volatile const LONG* p) { g_btEnabled = p; }
+static inline bool BtIsEnabled() { return g_btEnabled && (*g_btEnabled != 0); }
 
 static inline unsigned long long BtPtr(const void* p) {
     return (unsigned long long)(UINT_PTR)p;
@@ -42,6 +45,7 @@ static inline unsigned long long BtPtr(const void* p) {
 
 // 非阻塞记录：可变字段格式化在锁外做，seq 在锁内分配。
 static inline void BtTrace(const char* event, int frame, const char* phase, const char* extraFmt, ...) {
+    if (!BtIsEnabled()) return;
     char body[BTRACE1_REC_MAX]; body[0] = '\0';
     if (extraFmt && extraFmt[0]) {
         va_list ap; va_start(ap, extraFmt);
@@ -75,7 +79,7 @@ static inline void BtTrace(const char* event, int frame, const char* phase, cons
 // 丢失/截断的 LOSS / STATS 事件：meta=1 且【无 seq】，不占用/伪造真实事件 seq。
 // 统计键统一 lost / dropped / truncated（分析器识别这三键）。
 static inline void BtEmitStats() {
-    if (!g_btEmit) return;
+    if (!BtIsEnabled() || !g_btEmit) return;
     const long lost = g_btRing.loss, dropped = g_btRing.drop, truncated = g_btRing.trunc;
     const long pending = g_btRing.write - g_btRing.read;
     static long lastLost = 0, lastDropped = 0, lastTruncated = 0;
@@ -102,7 +106,7 @@ static inline void BtEmitStats() {
 
 // 有界批量 flush：每条记录单独 lock/unlock（锁内只 memcpy，不碰 I/O）。
 static inline void BtFlush(int batch) {
-    if (!g_btEmit) return;
+    if (!BtIsEnabled() || !g_btEmit) return;
     for (int i = 0; i < batch; ++i) {
         char rec[BTRACE1_REC_MAX];
         bool have = false;
@@ -125,7 +129,7 @@ static inline void BtFlush(int batch) {
 
 // SESSION：启动时立即落盘（不走 ring，避免被启动前竞争吞掉）。
 static inline void BtSession(const char* buildId, int schema, const char* baselineSha, const char* tag) {
-    if (!g_btEmit) return;
+    if (!BtIsEnabled() || !g_btEmit) return;
     char rec[BTRACE1_REC_MAX];
     _snprintf_s(rec, sizeof(rec), _TRUNCATE,
         "BTRACE1 seq=%ld tick=%llu tid=%lu event=SESSION frame=0 phase=init build_id=%s schema=%d baseline_sha=%s tag=%s",
