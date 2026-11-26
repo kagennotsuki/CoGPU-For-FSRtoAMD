@@ -821,16 +821,21 @@ cbuffer FastCB : register(b0) {
 Texture2D<float4>      gTrust : register(t0);
 Texture2DArray<float4> gSInc  : register(t1);
 Texture2D<float4>      gSrc   : register(t2);
+Texture2D<float>       gNear  : register(t3);
+Texture2D<float2>      gDSrc  : register(t4);
 RWTexture2D<float4>    gDst   : register(u0);
+RWTexture2D<float2>    gDDst  : register(u1);
 
 [numthreads(16, 16, 1)]
 void main(uint3 g : SV_DispatchThreadID) {
     uint2 ssize = gU[0].xy, dsize = gU[0].zw;
-    uint mode = gU[1].x, n = gU[1].y;
+    uint mode = gU[1].x, n = gU[1].y, dflag = gU[1].z;
     if (g.x >= dsize.x * n || g.y >= dsize.y) return;
     uint i = g.x / dsize.x;
     int2 d = int2(int(g.x - i * dsize.x), int(g.y));
     float4 s = float4(0, 0, 0, 0);
+    float2 dn = float2(0, 0);
+    bool doDepth = (dflag != 0u) && (i == 0u);
     [unroll] for (int y = 0; y < 2; ++y) {
         [unroll] for (int x = 0; x < 2; ++x) {
             int2 c = 2 * d + int2(x, y);
@@ -839,12 +844,15 @@ void main(uint3 g : SV_DispatchThreadID) {
                 float w = gTrust.Load(int3(c, 0)).r;
                 float3 inc = gSInc.Load(int4(c, int(i), 0)).rgb;
                 s += float4(inc * w, w);
+                if (doDepth) dn += float2(gNear.Load(int3(c, 0)).r * w, w);
             } else {
                 s += gSrc.Load(int3(c.x + int(i * ssize.x), c.y, 0));
+                if (doDepth) dn += gDSrc.Load(int3(c, 0)).rg;
             }
         }
     }
     gDst[g.xy] = s * 0.25;
+    if (doDepth) gDDst[d] = dn * 0.25;
 }
 )HLSL";
 
@@ -861,11 +869,21 @@ Texture2D<float4>        gL3       : register(t8);
 Texture2D<float4>        gL4       : register(t9);
 Texture2D<float4>        gL5       : register(t10);
 Texture2D<float4>        gL6       : register(t11);
+Texture2D<float>         gDepthIn  : register(t12);
+Texture2D<float>         gDepthCur : register(t13);
+Texture2D<float>         gDepthPrev: register(t14);
+Texture2D<float2>        gDP1      : register(t15);
+Texture2D<float2>        gDP2      : register(t16);
+Texture2D<float2>        gDP3      : register(t17);
+Texture2D<float2>        gDP4      : register(t18);
+Texture2D<float2>        gDP5      : register(t19);
+Texture2D<float2>        gDP6      : register(t20);
 
 RWTexture2D<float4>      gOut      : register(u0); // Pre: FastIn; Post: FastOut
 RWTexture2DArray<float4> gDInc     : register(u1);
 RWTexture2D<float4>      gBaseCur  : register(u2);
 RWTexture2D<float4>      gTrustOut : register(u3);
+RWTexture2D<float>       gDepthOut : register(u4);
 
 float3 IlClean3(float3 c) {
     if ((asuint(c.r) & 0x7F800000u) == 0x7F800000u) c.r = 0.0;
@@ -878,21 +896,22 @@ float2 IlClean2(float2 v) {
     if ((asuint(v.y) & 0x7F800000u) == 0x7F800000u) v.y = 0.0;
     return v;
 }
-float3 post_slot(uint k, float3 base, float3 rgb, uint flags, uint styles, float4 inten) {
+float3 post_slot_linear(uint k, float3 base, float3 rgb, uint flags, uint styles, float4 inten) {
     if ((flags & 2048u) == 0u) return rgb;
     uint kk = min(k, 3u);
     uint st = (styles >> (2u * kk)) & 3u;
     float I = inten[kk];
     rgb = saturate(min(I, 1.0) * (rgb - base) + base);
-    if (I > 1.0) {
-        float fl = 1.0 / 512.0, guard = 2.0;
-        float3 lw = float3(0.2126, 0.7152, 0.0722);
-        float ratio = (dot(rgb, lw) + fl) / (dot(base, lw) + fl);
-        float amp = clamp(pow(max(ratio, 1e-6), I), 1.0 / guard, guard);
-        rgb = saturate(rgb * (amp / max(ratio, 1e-6)));
-    }
     if (st != 0u) rgb = nr_style_grade(st, base, rgb, I);
     return rgb;
+}
+float3 post_overdrive_final(float3 base, float3 rgb, float I) {
+    if (I <= 1.0) return rgb;
+    float fl = 1.0 / 512.0, guard = 2.0;
+    float3 lw = float3(0.2126, 0.7152, 0.0722);
+    float ratio = (dot(rgb, lw) + fl) / (dot(base, lw) + fl);
+    float amp = clamp(pow(max(ratio, 1e-6), I), 1.0 / guard, guard);
+    return saturate(rgb * (amp / max(ratio, 1e-6)));
 }
 float3 bil_inc(uint i, float2 p, uint2 sz) {
     float2 f = p - 0.5, b0 = floor(f), w = f - b0;
@@ -912,6 +931,19 @@ float3 prev_base(float2 p, uint2 sz) {
     float3 d = gBasePrev.Load(int3(clamp(i0 + int2(1,1), int2(0,0), hi), 0)).rgb;
     return lerp(lerp(a, b, w.x), lerp(c, d, w.x), w.y);
 }
+float near_at(uint2 mt, uint2 mbase, uint2 mgrid, uint2 dgrid, uint flags) {
+    uint2 dt = min(((mt - mbase) * dgrid) / max(mgrid, uint2(1u, 1u)), max(dgrid, uint2(1u, 1u)) - 1u);
+    float d = gDepthIn.Load(int3(int2(dt), 0)).r;
+    return ((flags & 1024u) != 0u) ? d : (1.0 - d);
+}
+float2 dlv_read(uint l, int2 c) {
+    if (l == 1u) return gDP1.Load(int3(c, 0)).rg;
+    if (l == 2u) return gDP2.Load(int3(c, 0)).rg;
+    if (l == 3u) return gDP3.Load(int3(c, 0)).rg;
+    if (l == 4u) return gDP4.Load(int3(c, 0)).rg;
+    if (l == 5u) return gDP5.Load(int3(c, 0)).rg;
+    return gDP6.Load(int3(c, 0)).rg;
+}
 float4 lv_read(uint l, int2 c) {
     if (l == 1u) return gL1.Load(int3(c, 0));
     if (l == 2u) return gL2.Load(int3(c, 0));
@@ -920,23 +952,47 @@ float4 lv_read(uint l, int2 c) {
     if (l == 5u) return gL5.Load(int3(c, 0));
     return gL6.Load(int3(c, 0));
 }
-float4 lvb(uint l, uint i, float2 p, uint2 sz) {
+void lvgeo(uint l, float2 p, uint2 sz, out int2 c[4], out int wx, out float2 t) {
     uint2 w = sz;
     for (uint k = 0u; k < l; ++k) w = (w + 1u) / 2u;
-    float2 f = p / float(1u << l) - 0.5, b0 = floor(f), t = f - b0;
+    float2 f = p / float(1u << l) - 0.5, b0 = floor(f);
+    t = f - b0;
     int2 i0 = int2(b0), hi = int2(w) - 1;
-    int2 c0 = clamp(i0, int2(0,0), hi), c1 = clamp(i0 + int2(1,0), int2(0,0), hi);
-    int2 c2 = clamp(i0 + int2(0,1), int2(0,0), hi), c3 = clamp(i0 + int2(1,1), int2(0,0), hi);
-    int2 off = int2(int(i * w.x), 0);
-    float4 a = lv_read(l, c0 + off), b = lv_read(l, c1 + off);
-    float4 cc = lv_read(l, c2 + off), d = lv_read(l, c3 + off);
-    return lerp(lerp(a, b, t.x), lerp(cc, d, t.x), t.y);
+    c[0] = clamp(i0, int2(0, 0), hi); c[1] = clamp(i0 + int2(1, 0), int2(0, 0), hi);
+    c[2] = clamp(i0 + int2(0, 1), int2(0, 0), hi); c[3] = clamp(i0 + int2(1, 1), int2(0, 0), hi);
+    wx = int(w.x);
 }
-float3 pull_inc(uint i, float2 p, uint2 sz) {
-    float4 top = lvb(6u, i, p, sz);
+float4 lvw(uint l, float2 p, uint2 sz, float nearVal) {
+    int2 c[4]; int wx; float2 t;
+    lvgeo(l, p, sz, c, wx, t);
+    float4 wb = float4((1.0 - t.x) * (1.0 - t.y), t.x * (1.0 - t.y), (1.0 - t.x) * t.y, t.x * t.y);
+    [unroll] for (int k = 0; k < 4; ++k) {
+        float2 dn = dlv_read(l, c[k]);
+        float nk = (dn.y > 1e-6) ? (dn.x / dn.y) : -1.0;
+        float rel = (nk < 0.0) ? 1.0 : (abs(nk - nearVal) / max(max(nk, nearVal), 1e-7));
+        wb[k] *= 1.0 - smoothstep(0.05, 0.2, rel);
+    }
+    return wb;
+}
+float4 lvb_ex(uint l, uint i, float2 p, uint2 sz, bool bil, float4 wb) {
+    int2 c[4]; int wx; float2 t;
+    lvgeo(l, p, sz, c, wx, t);
+    int2 off = int2(int(i) * wx, 0);
+    float4 a = lv_read(l, c[0] + off), b = lv_read(l, c[1] + off);
+    float4 cc = lv_read(l, c[2] + off), d = lv_read(l, c[3] + off);
+    if (!bil) return lerp(lerp(a, b, t.x), lerp(cc, d, t.x), t.y);
+    float sw = wb.x + wb.y + wb.z + wb.w;
+    return (sw > 1e-4) ? ((a * wb.x + b * wb.y + cc * wb.z + d * wb.w) / sw * min(sw * 4.0, 1.0)) : float4(0, 0, 0, 0);
+}
+float3 pull_inc(uint i, float2 p, uint2 sz, bool bil, float4 wl[6]) {
+    float4 top0 = lvb_ex(6u, i, p, sz, false, float4(0, 0, 0, 0));
+    float4 topd = bil ? lvb_ex(6u, i, p, sz, true, wl[5]) : top0;
+    float4 top = (topd.a > 1e-4) ? topd : top0;
     float3 e = (top.a > 1e-4) ? (top.rgb / top.a) : float3(0, 0, 0);
     for (uint l = 5u; l >= 1u; --l) {
-        float4 m = lvb(l, i, p, sz);
+        float4 m0 = lvb_ex(l, i, p, sz, false, float4(0, 0, 0, 0));
+        float4 md = bil ? lvb_ex(l, i, p, sz, true, wl[l - 1u]) : m0;
+        float4 m = (md.a > 1e-4) ? md : m0;
         e = m.rgb + (1.0 - m.a) * e;
     }
     return e;
@@ -965,6 +1021,7 @@ void main(uint3 id : SV_DispatchThreadID) {
     uint  flags = gU[2].y;
     uint  styles = gU[2].z;
     uint  warmMask = gU[3].y;
+    uint2 dgrid = max(gU[3].zw, uint2(1u, 1u));
     float2 mscale = gF[0].xy;
     float  k0 = gF[0].z, k1 = gF[0].w;
     float4 inten = gF[1];
@@ -978,6 +1035,12 @@ void main(uint3 id : SV_DispatchThreadID) {
         return;
     }
 
+    if (mode == 5u) {
+        uint2 mt = mbase + min(uint2((float2(id.xy) + 0.5) * float2(mgrid) / float2(sz)), mgrid - 1u);
+        gDepthOut[id.xy] = near_at(mt, mbase, mgrid, dgrid, flags);
+        return;
+    }
+
     if (mode == 4u) {
         // Hole fill from 6-level pyramid (pure SRV gSInc -> pure UAV gDInc)
         float trust = gTrustIn.Load(int3(ip, 0)).r;
@@ -987,14 +1050,24 @@ void main(uint3 id : SV_DispatchThreadID) {
             }
             return;
         }
+        bool bil = (flags & 67108864u) != 0u;
+        float4 wl[6];
+        if (bil) {
+            float nearVal = gDepthCur.Load(int3(ip, 0)).r;
+            [unroll] for (uint l = 1u; l <= 6u; ++l) {
+                wl[l - 1u] = lvw(l, float2(id.xy) + 0.5, sz, nearVal);
+            }
+        } else {
+            [unroll] for (uint l = 0u; l < 6u; ++l) wl[l] = float4(0, 0, 0, 0);
+        }
         float3 z = saturate(IlClean3(gProxy.Load(int3(ip, 0)).rgb));
         for (uint i = 0u; i < n; ++i) {
             float3 curD = gSInc.Load(int4(ip, int(i), 0)).rgb;
-            float3 fill = pull_inc(i, float2(id.xy) + 0.5, sz);
+            float3 fill = pull_inc(i, float2(id.xy) + 0.5, sz, bil, wl);
             float3 v = lerp(fill, curD, trust);
             gDInc[uint3(id.xy, i)] = float4(v, 0.0);
             if (i < slot && ((warmMask & (1u << i)) != 0u)) {
-                z = post_slot(i, z, z + v, flags, styles, inten);
+                z = post_slot_linear(i, z, z + v, flags, styles, inten);
             }
         }
         gOut[id.xy] = float4(saturate(z), 1.0);
@@ -1009,6 +1082,18 @@ void main(uint3 id : SV_DispatchThreadID) {
         bool inside = true;
         if ((flags & 1u) != 0u) {
             uint2 t = mbase + min(uint2((float2(id.xy) + 0.5) * float2(mgrid) / float2(sz)), mgrid - 1u);
+            if ((flags & 256u) != 0u) {
+                uint2 best = t;
+                float bn = near_at(t, mbase, mgrid, dgrid, flags);
+                [unroll] for (int dy = -1; dy <= 1; ++dy) {
+                    [unroll] for (int dx = -1; dx <= 1; ++dx) {
+                        uint2 c = uint2(clamp(int2(t) + int2(dx, dy), int2(mbase), int2(mbase + mgrid) - 1));
+                        float nn = near_at(c, mbase, mgrid, dgrid, flags);
+                        if (nn > bn) { bn = nn; best = c; }
+                    }
+                }
+                t = best;
+            }
             q += IlClean2(gMotion.Load(int3(int2(t), 0)).xy) * mscale;
             inside = all(q >= 0.0) && all(q <= float2(sz));
         }
@@ -1058,6 +1143,19 @@ void main(uint3 id : SV_DispatchThreadID) {
                 float t_b = 1.0 - smoothstep(k0, k1, max(ov.r, max(ov.g, ov.b)));
                 trust = min(trust, t_b);
             }
+            if ((flags & 512u) != 0u && inside) {
+                int2 b0 = int2(floor(q - 0.5)), hiD = int2(sz) - 1;
+                float np = 0.0;
+                [unroll] for (int dy = 0; dy <= 1; ++dy) {
+                    [unroll] for (int dx = 0; dx <= 1; ++dx) {
+                        np = max(np, gDepthPrev.Load(int3(clamp(b0 + int2(dx, dy), int2(0, 0), hiD), 0)).r);
+                    }
+                }
+                float nc = gDepthCur.Load(int3(ip, 0)).r;
+                float r = (np - nc) / max(nc, 1e-7);
+                float t_d = lerp(1.0 - smoothstep(0.05, 0.2, r), 1.0, stay);
+                trust = min(trust, t_d);
+            }
         }
         if ((flags & 33554433u) == 33554433u && !inside) trust = 0.0;
         gTrustOut[id.xy] = float4(trust, trust, trust, 1.0);
@@ -1068,7 +1166,7 @@ void main(uint3 id : SV_DispatchThreadID) {
             if (validSlot && stay > 0.0) v = lerp(v, gSInc.Load(int4(ip, int(i), 0)).rgb, stay);
             gDInc[uint3(id.xy, i)] = float4(v, 0.0);
             if (i < slot && validSlot) {
-                z = post_slot(i, z, z + trust * v, flags, styles, inten);
+                z = post_slot_linear(i, z, z + trust * v, flags, styles, inten);
             }
         }
         gOut[id.xy] = float4(saturate(z), 1.0);
@@ -1092,8 +1190,9 @@ void main(uint3 id : SV_DispatchThreadID) {
             v = lerp(fresh, v, trust);
         }
         gDInc[uint3(id.xy, i)] = float4(v, 0.0);
-        o = post_slot(i, o, o + v, flags, styles, inten);
+        o = post_slot_linear(i, o, o + v, flags, styles, inten);
     }
+    if ((flags & 2048u) != 0u && inten.x > 1.0) o = post_overdrive_final(b, o, inten.x);
     gOut[id.xy] = float4(saturate(o), 1.0);
 }
 )HLSL";
@@ -1115,9 +1214,9 @@ void main(uint3 id : SV_DispatchThreadID) {
 
 class Engine {
 public:
-    static constexpr UINT kSrvCount    = 12;
+    static constexpr UINT kSrvCount    = 22;
     static constexpr UINT kUavCount    = 10;
-    static constexpr UINT kPageStrides = kSrvCount + kUavCount; // 22
+    static constexpr UINT kPageStrides = kSrvCount + kUavCount; // 32
     static constexpr UINT kPagesPerFrm = 24;
     static constexpr UINT kTotalPages  = kPagesPerFrm * 2;       // 48 pages double-buffered
 
@@ -1127,8 +1226,10 @@ public:
         histValid_ = false;
         histCur_ = 0;
         ilValid_ = false;
+        ilDepthValid_ = false;
         ilCur_ = 0;
         ilBcur_ = 0;
+        ilDcur_ = 0;
         ilFrame_ = 0;
         ilWarmMask_ = 0;
         ilSlotsBuilt_ = 0;
@@ -1161,15 +1262,16 @@ public:
         for (int i = 0; i < 2; ++i) {
             D_[i].Reset(); T_[i].Reset(); G_[i].Reset();
             F0_[i].Reset(); F1_[i].Reset();
-            ilBase_[i].Reset(); ilInc_[i].Reset();
+            ilBase_[i].Reset(); ilInc_[i].Reset(); ilDepth_[i].Reset();
         }
         ilTrust_.Reset();
-        for (int l = 0; l < 6; ++l) ilPyr_[l].Reset();
+        for (int l = 0; l < 6; ++l) { ilPyr_[l].Reset(); ilDPyr_[l].Reset(); }
     }
 
     void InvalidateHistory() {
         histValid_ = false;
         ilValid_ = false;
+        ilDepthValid_ = false;
         ilWarmMask_ = 0;
         ilFrame_ = 0;
         didPreThisFrame_ = false;
@@ -1186,6 +1288,7 @@ public:
     bool IsReady() const { return ready_ && !failed_; }
     bool DidPreThisFrame() const { return didPreThisFrame_; }
     int  LastEffectiveMethod() const { return lastPreMethod_; }
+    uint32_t LastPreSlot() const { return lastPreSlot_; }
     bool LastUsedNeutralCore() const { return lastPreMethod_ == kInterleaved && (lastPreFlags_ & 2048u) != 0u; }
 
     bool Ensure(ID3D12Device* dev, UINT w, UINT h, const Settings& s, std::string& logErr) {
@@ -1223,7 +1326,10 @@ public:
                               ID3D12Resource* srcColor, D3D12_RESOURCE_STATES srcState,
                               ID3D12Resource* mvTex, D3D12_RESOURCE_STATES mvState,
                               float mvScaleX, float mvScaleY, bool reset,
-                              const Settings& s, int& outEffMethod, bool& outNeutralCore) {
+                              const Settings& s, int& outEffMethod, bool& outNeutralCore,
+                              ID3D12Resource* depthTex = nullptr,
+                              D3D12_RESOURCE_STATES depthState = D3D12_RESOURCE_STATE_COMMON,
+                              bool depthInverted = true) {
         didPreThisFrame_ = false;
         outNeutralCore = false;
         if (!ready_ || !cl || !srcColor) {
@@ -1232,6 +1338,7 @@ public:
         }
 
         const bool hasMv = (mvTex != nullptr);
+        const bool hasDepth = (depthTex != nullptr);
         const int eff = EffectiveMethod(s, hasMv);
         outEffMethod = eff;
 
@@ -1239,6 +1346,7 @@ public:
             if (reset || eff != lastPreMethod_) {
                 histValid_ = false;
                 ilValid_ = false;
+                ilDepthValid_ = false;
                 ilWarmMask_ = 0;
                 ilFrame_ = 0;
             }
@@ -1342,8 +1450,10 @@ public:
 
         lastPreSlot_ = ilFrame_ % N;
         const bool isMoving = hasMv && ilValid_ && (ilWarmMask_ == ((1u << N) - 1u));
+        const bool canDepthDisocc = hasDepth && ilDepthValid_;
         const uint32_t baseNext = ilBcur_ ^ 1u;
         const uint32_t incNext  = ilCur_  ^ 1u;
+        const uint32_t depCur   = ilDcur_ ^ 1u;
 
         uint32_t stylesPack = 0u;
         for (uint32_t k = 0; k < 4u; ++k) {
@@ -1354,11 +1464,26 @@ public:
 
         const uint32_t gx = (w_ + 15u) / 16u, gy = (h_ + 15u) / 16u;
         const uint32_t baseFlags =
-            (isMoving ? (1u | 4u | 8u | 128u | 524288u | 1048576u | 33554432u | 65536u) : 0u) |
+            (isMoving ? (1u | 8u | 128u | 524288u | 1048576u | 33554432u | 65536u |
+                         (hasDepth ? (256u | 67108864u) : 0u) | (canDepthDisocc ? 512u : 0u))
+                      : 0u) |
+            (depthInverted ? 1024u : 0u) |
             (graded ? 2048u : 0u);
+
+        uint32_t dGridW = w_, dGridH = h_;
+        if (hasDepth) {
+            const D3D12_RESOURCE_DESC dd = depthTex->GetDesc();
+            dGridW = (uint32_t)dd.Width;
+            dGridH = (uint32_t)dd.Height;
+        }
 
         Barrier(cl, srcColor, srcState, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
         if (mvTex) Barrier(cl, mvTex, mvState, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        if (hasDepth) {
+            Barrier(cl, depthTex, depthState, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+            Barrier(cl, ilDepth_[ilDcur_].Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+            Barrier(cl, ilDepth_[depCur].Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        }
         Barrier(cl, ilBase_[ilBcur_].Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
         Barrier(cl, ilInc_[ilCur_].Get(),   D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
         Barrier(cl, ilBase_[baseNext].Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
@@ -1370,20 +1495,37 @@ public:
         cb[0] = w_; cb[1] = h_; cb[2] = 0; cb[3] = 0;
         cb[4] = w_; cb[5] = h_; cb[6] = 0u; cb[7] = lastPreSlot_;
         cb[8] = N;  cb[9] = baseFlags; cb[10] = stylesPack; cb[11] = baseNext;
-        cb[12] = incNext; cb[13] = ilWarmMask_;
+        cb[12] = incNext; cb[13] = ilWarmMask_; cb[14] = dGridW; cb[15] = dGridH;
         float k0 = 0.02f, k1 = 0.06f;
         memcpy(&cb[16], &mvScaleX, 4); memcpy(&cb[17], &mvScaleY, 4);
         memcpy(&cb[18], &k0, 4);       memcpy(&cb[19], &k1, 4);
         memcpy(&cb[20], &lastPreInten_[0], 16);
 
+        if (hasDepth) {
+            // Mode 5: store current frame's nearness into ilDepth_[depCur] before mode 0 / mode 4 read it
+            cb[6] = 5u;
+            ID3D12Resource* srvs5[22] = {};
+            srvs5[12] = depthTex;
+            ID3D12Resource* uavs5[10] = {};
+            uavs5[4] = ilDepth_[depCur].Get();
+            Dispatch(cl, psoIl_.Get(), srvs5, 13, uavs5, 5, cb, gx, gy);
+            Barrier(cl, ilDepth_[depCur].Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+            cb[6] = 0u;
+        }
+
         // Mode 0: warp slots + write BaseCur & Trust & FastIn
-        ID3D12Resource* srvs0[12] = {
-            srcColor, ilBase_[ilBcur_].Get(), ilInc_[ilCur_].Get(), mvTex ? mvTex : srcColor
-        };
+        ID3D12Resource* srvs0[22] = {};
+        srvs0[0]  = srcColor;
+        srvs0[1]  = ilBase_[ilBcur_].Get();
+        srvs0[2]  = ilInc_[ilCur_].Get();
+        srvs0[3]  = mvTex ? mvTex : srcColor;
+        srvs0[12] = hasDepth ? depthTex : srcColor;
+        srvs0[13] = ilDepth_[depCur].Get();
+        srvs0[14] = ilDepth_[ilDcur_].Get();
         ID3D12Resource* uavs0[10] = {
             fastIn_.Get(), ilInc_[incNext].Get(), ilBase_[baseNext].Get(), ilTrust_.Get()
         };
-        Dispatch(cl, psoIl_.Get(), srvs0, 4, uavs0, 4, cb, gx, gy);
+        Dispatch(cl, psoIl_.Get(), srvs0, hasDepth ? 15u : 4u, uavs0, 4, cb, gx, gy);
 
         uint32_t latestInc = incNext;
         if (isMoving) {
@@ -1396,30 +1538,44 @@ public:
             for (int l = 0; l < 6; ++l) {
                 uint32_t dw = (sw + 1u) / 2u, dh = (sh + 1u) / 2u;
                 Barrier(cl, ilPyr_[l].Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+                if (hasDepth) Barrier(cl, ilDPyr_[l].Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
                 UINT pcb[32]{};
                 pcb[0] = sw; pcb[1] = sh; pcb[2] = dw; pcb[3] = dh;
                 pcb[4] = (l == 0) ? 0u : 1u;
                 pcb[5] = N;
-                ID3D12Resource* ps[12] = { ilTrust_.Get(), ilInc_[incNext].Get(), (l == 0) ? ilInc_[incNext].Get() : ilPyr_[l - 1].Get() };
-                ID3D12Resource* pu[10] = { ilPyr_[l].Get() };
-                Dispatch(cl, psoIlPp_.Get(), ps, 3, pu, 1, pcb, (dw * N + 15u) / 16u, (dh + 15u) / 16u);
+                pcb[6] = hasDepth ? 1u : 0u;
+                ID3D12Resource* ps[22] = {};
+                ps[0] = ilTrust_.Get();
+                ps[1] = ilInc_[incNext].Get();
+                ps[2] = (l == 0) ? ilInc_[incNext].Get() : ilPyr_[l - 1].Get();
+                ps[3] = ilDepth_[depCur].Get();
+                ps[4] = (l == 0) ? ilDepth_[depCur].Get() : ilDPyr_[l - 1].Get();
+                ID3D12Resource* pu[10] = { ilPyr_[l].Get(), hasDepth ? ilDPyr_[l].Get() : nullptr };
+                Dispatch(cl, psoIlPp_.Get(), ps, hasDepth ? 5u : 3u, pu, hasDepth ? 2u : 1u, pcb, (dw * N + 15u) / 16u, (dh + 15u) / 16u);
                 Barrier(cl, ilPyr_[l].Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+                if (hasDepth) Barrier(cl, ilDPyr_[l].Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
                 sw = dw; sh = dh;
             }
 
             // Fill holes & compose slot input into fastIn_ (pure SRV incNext -> pure UAV ilCur_)
             cb[6] = 4u; // mode 4
             cb[9] = baseFlags | 64u;
-            ID3D12Resource* srvs4[12] = {
-                srcColor, ilBase_[ilBcur_].Get(), ilInc_[incNext].Get(), mvTex ? mvTex : srcColor,
-                srcColor, ilTrust_.Get(),
-                ilPyr_[0].Get(), ilPyr_[1].Get(), ilPyr_[2].Get(), ilPyr_[3].Get(), ilPyr_[4].Get(), ilPyr_[5].Get()
-            };
+            ID3D12Resource* srvs4[22] = {};
+            srvs4[0] = srcColor; srvs4[1] = ilBase_[ilBcur_].Get(); srvs4[2] = ilInc_[incNext].Get();
+            srvs4[3] = mvTex ? mvTex : srcColor; srvs4[4] = srcColor; srvs4[5] = ilTrust_.Get();
+            for (int l = 0; l < 6; ++l) srvs4[6 + l] = ilPyr_[l].Get();
+            if (hasDepth) {
+                srvs4[12] = depthTex;
+                srvs4[13] = ilDepth_[depCur].Get();
+                srvs4[14] = ilDepth_[ilDcur_].Get();
+                for (int l = 0; l < 6; ++l) srvs4[15 + l] = ilDPyr_[l].Get();
+            }
             ID3D12Resource* uavs4[10] = { fastIn_.Get(), ilInc_[ilCur_].Get(), ilBase_[baseNext].Get(), ilTrust_.Get() };
-            Dispatch(cl, psoIl_.Get(), srvs4, 12, uavs4, 4, cb, gx, gy);
+            Dispatch(cl, psoIl_.Get(), srvs4, hasDepth ? 21u : 12u, uavs4, 4, cb, gx, gy);
 
             for (int l = 0; l < 6; ++l) {
                 Barrier(cl, ilPyr_[l].Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
+                if (hasDepth) Barrier(cl, ilDPyr_[l].Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
             }
             Barrier(cl, ilTrust_.Get(),        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
             Barrier(cl, ilInc_[incNext].Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
@@ -1433,6 +1589,13 @@ public:
             lastPreFlags_ = baseFlags;
         }
 
+        if (hasDepth) {
+            Barrier(cl, ilDepth_[depCur].Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
+            Barrier(cl, ilDepth_[ilDcur_].Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
+            Barrier(cl, depthTex, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, depthState);
+            ilDcur_ = depCur;
+            ilDepthValid_ = true;
+        }
         Barrier(cl, fastIn_.Get(),           D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON);
         fastInState_ = D3D12_RESOURCE_STATE_COMMON;
         Barrier(cl, ilBase_[baseNext].Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON);
@@ -1808,12 +1971,14 @@ private:
         for (int i = 0; i < 2; ++i) {
             if (!ilBase_[i] && !CreateTex2D(dev_.Get(), w_, h_, DXGI_FORMAT_R16G16B16A16_FLOAT, 1, false, true, ilBase_[i], "ilBase", err)) return false;
             if (!ilInc_[i]  && !CreateTex2D(dev_.Get(), w_, h_, DXGI_FORMAT_R16G16B16A16_FLOAT, (UINT16)kMaxIlSlots, false, true, ilInc_[i], "ilInc", err)) return false;
+            if (!ilDepth_[i] && !CreateTex2D(dev_.Get(), w_, h_, DXGI_FORMAT_R32_FLOAT, 1, false, true, ilDepth_[i], "ilDepth", err)) return false;
         }
         if (!ilTrust_ && !CreateTex2D(dev_.Get(), w_, h_, DXGI_FORMAT_R16_FLOAT, 1, false, true, ilTrust_, "ilTrust", err)) return false;
         UINT sw = w_, sh = h_;
         for (int l = 0; l < 6; ++l) {
             sw = (sw + 1u) / 2u; sh = (sh + 1u) / 2u;
-            if (!ilPyr_[l] && !CreateTex2D(dev_.Get(), sw * kMaxIlSlots, sh, DXGI_FORMAT_R16G16B16A16_FLOAT, 1, false, true, ilPyr_[l], "ilPyr", err)) return false;
+            if (!ilPyr_[l]  && !CreateTex2D(dev_.Get(), sw * kMaxIlSlots, sh, DXGI_FORMAT_R16G16B16A16_FLOAT, 1, false, true, ilPyr_[l],  "ilPyr",  err)) return false;
+            if (!ilDPyr_[l] && !CreateTex2D(dev_.Get(), sw, sh, DXGI_FORMAT_R32G32_FLOAT, 1, false, true, ilDPyr_[l], "ilDPyr", err)) return false;
         }
         return true;
     }
@@ -1836,6 +2001,14 @@ private:
         case DXGI_FORMAT_R8G8B8A8_TYPELESS:     return DXGI_FORMAT_R8G8B8A8_UNORM;
         case DXGI_FORMAT_B8G8R8A8_TYPELESS:     return DXGI_FORMAT_B8G8R8A8_UNORM;
         case DXGI_FORMAT_R16G16_TYPELESS:       return DXGI_FORMAT_R16G16_FLOAT;
+        case DXGI_FORMAT_R32_TYPELESS:
+        case DXGI_FORMAT_D32_FLOAT:             return DXGI_FORMAT_R32_FLOAT;
+        case DXGI_FORMAT_R32G8X24_TYPELESS:
+        case DXGI_FORMAT_D32_FLOAT_S8X24_UINT:  return DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS;
+        case DXGI_FORMAT_R24G8_TYPELESS:
+        case DXGI_FORMAT_D24_UNORM_S8_UINT:     return DXGI_FORMAT_R24_UNORM_X8_TYPELESS;
+        case DXGI_FORMAT_R16_TYPELESS:
+        case DXGI_FORMAT_D16_UNORM:             return DXGI_FORMAT_R16_UNORM;
         default: return fmt;
         }
     }
@@ -1934,9 +2107,11 @@ private:
     float lastFine_           = 1.0f;
 
     bool     ilValid_      = false;
+    bool     ilDepthValid_ = false;
     bool     ilGradedLast_ = false;
     uint32_t ilCur_        = 0;
     uint32_t ilBcur_       = 0;
+    uint32_t ilDcur_       = 0;
     uint32_t ilFrame_      = 0;
     uint32_t ilWarmMask_   = 0;
     uint32_t ilSlotsBuilt_ = 0;
@@ -1954,7 +2129,7 @@ private:
     ComPtr<ID3D12Resource> fastIn_, fastOut_, fastOut8_, fbAdd_, fineH_;
     HANDLE fastInShared_ = nullptr;
     ComPtr<ID3D12Resource> D_[2], T_[2], G_[2], F0_[2], F1_[2];
-    ComPtr<ID3D12Resource> ilBase_[2], ilInc_[2], ilTrust_, ilPyr_[6];
+    ComPtr<ID3D12Resource> ilBase_[2], ilInc_[2], ilDepth_[2], ilTrust_, ilPyr_[6], ilDPyr_[6];
 };
 
 } // namespace FastPasses

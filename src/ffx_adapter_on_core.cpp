@@ -488,6 +488,7 @@ extern "C" __declspec(dllexport) ffxReturnCode_t ffxDispatch(ffxContext* context
     ad.isHdr = flagsKnown && ((createFlags & FFX_UPSCALE_ENABLE_HIGH_DYNAMIC_RANGE) != 0u);
     ad.autoExposure = flagsKnown && ((createFlags & FFX_UPSCALE_ENABLE_AUTO_EXPOSURE) != 0u);
     ad.isPq = (d->flags & FFX_UPSCALE_FLAG_NON_LINEAR_COLOR_PQ) != 0u;
+    ad.depthInverted = flagsKnown ? ((createFlags & FFX_UPSCALE_ENABLE_DEPTH_INVERTED) != 0u) : true;
     ad.preExposure = (std::isfinite(d->preExposure) && d->preExposure > 1e-6f) ? d->preExposure : 1.0f;
     ad.exposureScale = 1.0f;
     ad.okCode = FFX_API_RETURN_OK;

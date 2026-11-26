@@ -19,14 +19,14 @@ struct Input {
     AdapterFrameDesc desc{}; // stored with an empty ext/list/output plus adapter snapshot
     UINT netW = 0, netH = 0;
     ComPtr<ID3D12Resource> source[6], captured[6]; // color, MV, depth, exposure, reactive, transparency
-    ComPtr<ID3D12Resource> fed, packed, composed, localAnswer, answerImage, add4k;
+    ComPtr<ID3D12Resource> fed, packed, depthPacked, composed, localAnswer, answerImage, add4k;
     ComPtr<ID3D12Resource> scaleTex, scaleRb;
     UINT hdrMode = 0; // 0=SDR, 1=LinearHdr, 2=PqHdr10
     bool hasExposure = false, autoExposure = false, isHdrFlag = false;
     float preExposure = 1.0f, exposureScale = 1.0f;
     ComPtr<ID3D12DescriptorHeap> heap;
     ComPtr<ID3D12RootSignature> rs;
-    ComPtr<ID3D12PipelineState> capturePso[2], presentPso[2];
+    ComPtr<ID3D12PipelineState> capturePso[3], presentPso[2];
 };
 static Input inputs[kSlots];
 struct Answer {

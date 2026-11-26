@@ -8,10 +8,14 @@ static inline UINT ColorPitch() { return ((kNetW * 8u) + 255u) & ~255u; }
 static inline UINT64 ColorPlane() { return UINT64(ColorPitch()) * UINT64(kNetH); }
 static inline UINT MvPitch() { return ((kNetW * 4u) + 255u) & ~255u; }
 static inline UINT64 MvPlane() { return UINT64(MvPitch()) * UINT64(kNetH); }
+static inline UINT DepthPitch() { return ((kNetW * 4u) + 255u) & ~255u; }
+static inline UINT64 DepthPlane() { return UINT64(DepthPitch()) * UINT64(kNetH); }
 static inline UINT Pitch() { return MvPitch(); }
 static inline UINT64 Plane() { return ColorPlane(); }
 static inline UINT PitchFor(DXGI_FORMAT fmt) {
-    return (fmt == DXGI_FORMAT_R16G16B16A16_FLOAT) ? ColorPitch() : MvPitch();
+    if (fmt == DXGI_FORMAT_R16G16B16A16_FLOAT) return ColorPitch();
+    if (fmt == DXGI_FORMAT_R32_FLOAT) return DepthPitch();
+    return MvPitch();
 }
 static inline UINT64 PlaneFor(DXGI_FORMAT fmt) {
     return UINT64(PitchFor(fmt)) * UINT64(kNetH);
@@ -44,6 +48,7 @@ struct Slot {
     int diagAttempt = -1;
     bool diagFollow = false, diagPrintedLate = false;
     bool a3 = false;  // published by Seal; all A3 producer/worker bookkeeping is under the A3 ring lock
+    bool hasDepth = false;
 };
 static constexpr int kSlots = 12; // A3 uses 12 independent slots to cover >=7-frame GPU pipeline depth; legacy A2 uses first K
 static Slot slots[kSlots];
@@ -122,7 +127,9 @@ static D3D12_TEXTURE_COPY_LOCATION Tex(ID3D12Resource* t) {
 }
 static void RecordWorkerCopies(ID3D12GraphicsCommandList* cl, ID3D12Resource* source,
                                ID3D12Resource* color, ID3D12Resource* mv,
-                               D3D12_RESOURCE_STATES colorState, D3D12_RESOURCE_STATES mvState) {
+                               D3D12_RESOURCE_STATES colorState, D3D12_RESOURCE_STATES mvState,
+                               ID3D12Resource* depth = nullptr,
+                               D3D12_RESOURCE_STATES depthState = D3D12_RESOURCE_STATE_COMMON) {
     const DXGI_FORMAT cFmt = color->GetDesc().Format;
     auto cs = Foot(source, cFmt, 0);
     auto vs = Foot(source, DXGI_FORMAT_R16G16_FLOAT, PlaneFor(cFmt));
@@ -130,10 +137,17 @@ static void RecordWorkerCopies(ID3D12GraphicsCommandList* cl, ID3D12Resource* so
     F9Id::Transition(cl, source, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE);
     F9Id::Transition(cl, color, colorState, D3D12_RESOURCE_STATE_COPY_DEST);
     F9Id::Transition(cl, mv, mvState, D3D12_RESOURCE_STATE_COPY_DEST);
+    if (depth) F9Id::Transition(cl, depth, depthState, D3D12_RESOURCE_STATE_COPY_DEST);
     cl->CopyTextureRegion(&cd, 0, 0, 0, &cs, nullptr);
     cl->CopyTextureRegion(&vd, 0, 0, 0, &vs, nullptr);
+    if (depth) {
+        auto ds = Foot(source, DXGI_FORMAT_R32_FLOAT, PlaneFor(cFmt) + MvPlane());
+        auto dd = Tex(depth);
+        cl->CopyTextureRegion(&dd, 0, 0, 0, &ds, nullptr);
+    }
     F9Id::Transition(cl, color, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON);
     F9Id::Transition(cl, mv, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON);
+    if (depth) F9Id::Transition(cl, depth, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON);
     F9Id::Transition(cl, source, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON);
 }
 struct Token {
@@ -159,7 +173,7 @@ static bool Cancel(Token t) {
 static void ResetAll() {
     for (auto& s : slots) {
         ReleaseSlotBuffers(s);
-        s.key = {}; s.seq = 0; s.retire = 0; s.sealTick = 0; s.a3 = false;
+        s.key = {}; s.seq = 0; s.retire = 0; s.sealTick = 0; s.a3 = false; s.hasDepth = false;
         s.gate.store(Free);
     }
     for (auto& r : rejected) r.store(0);
@@ -477,9 +491,9 @@ struct Producer {
         p->gate.store((p->seq << kShift) | Free);
         p = nullptr;
     }
-    void Seal(ID3D12Resource* color, ID3D12Resource* mv) {
+    void Seal(ID3D12Resource* color, ID3D12Resource* mv, ID3D12Resource* depth = nullptr) {
         // Sources already COPY_SOURCE; neither data nor marker can be published
-        // separately. This list also records the local color/MV capture.
+        // separately. This list also records the local color/MV/depth capture.
         auto srcC = Tex(color), srcM = Tex(mv);
         const DXGI_FORMAT cFmt = p->a3 ? DXGI_FORMAT_R16G16B16A16_FLOAT : DXGI_FORMAT_R8G8B8A8_UNORM;
         const UINT64 pl = PlaneFor(cFmt);
@@ -489,6 +503,12 @@ struct Producer {
         F9Id::Transition(cl, p->bufA.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST);
         cl->CopyTextureRegion(&dc, 0, 0, 0, &srcC, nullptr);
         cl->CopyTextureRegion(&dm, 0, 0, 0, &srcM, nullptr);
+        p->hasDepth = (depth != nullptr);
+        if (depth) {
+            auto srcD = Tex(depth);
+            auto dd = Foot(p->bufA.Get(), DXGI_FORMAT_R32_FLOAT, pl + MvPlane());
+            cl->CopyTextureRegion(&dd, 0, 0, 0, &srcD, nullptr);
+        }
         F9Id::Transition(cl, p->bufA.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON);
         cl->CopyTextureRegion(&cpu, 0, 0, 0, &srcC, nullptr);
         cl->CopyBufferRegion(p->mirror.Get(), pl, p->marker.Get(), 0, sizeof(F9Id::Stamp));

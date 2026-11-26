@@ -580,6 +580,7 @@ static NVSDK_NGX_Result __cdecl hk_evaluate(ID3D12GraphicsCommandList* cmd, cons
     ad.isHdr = tCopy.flagsKnown && ((tCopy.createFlags & (1u << 0)) != 0u);
     ad.autoExposure = tCopy.flagsKnown && ((tCopy.createFlags & (1u << 6)) != 0u);
     ad.isPq = false;
+    ad.depthInverted = tCopy.flagsKnown ? ((tCopy.createFlags & (1u << 1)) != 0u) : true;
     ad.preExposure = preExposure;
     ad.exposureScale = expoScale;
     ad.okCode = NVSDK_NGX_Result_Success;

@@ -39,6 +39,7 @@ struct AdapterFrameDesc {
     bool isHdr = false;
     bool autoExposure = false;
     bool isPq = false;
+    bool depthInverted = true;
     float preExposure = 1.0f;
     float exposureScale = 1.0f;
     int okCode = 0;

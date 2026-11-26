@@ -3,8 +3,8 @@
 
 namespace A3 {
 enum View : UINT { Base, Mv, Fed, LocalAnswer, ComposeSrc, OutSrc, AnswerImage,
-                   Exposure, ScaleSrv, CommitSrv,
-                   FedUav, MvUav, ComposeUav, Add4kUav, ScaleUav, CommitUav, ViewCount };
+                   Exposure, ScaleSrv, CommitSrv, Depth,
+                   FedUav, MvUav, ComposeUav, Add4kUav, ScaleUav, CommitUav, DepthUav, ViewCount };
 static inline UINT64 Bytes() { return A2In::Plane(); }
 static void* lastContext = nullptr;
 static bool everActive = false;
@@ -34,7 +34,14 @@ static DXGI_FORMAT UnwrapColorFormat(DXGI_FORMAT fmt) {
     case DXGI_FORMAT_R10G10B10A2_TYPELESS:  return DXGI_FORMAT_R10G10B10A2_UNORM;
     case DXGI_FORMAT_R8G8B8A8_TYPELESS:     return DXGI_FORMAT_R8G8B8A8_UNORM;
     case DXGI_FORMAT_B8G8R8A8_TYPELESS:     return DXGI_FORMAT_B8G8R8A8_UNORM;
-    case DXGI_FORMAT_R32_TYPELESS:          return DXGI_FORMAT_R32_FLOAT;
+    case DXGI_FORMAT_R32_TYPELESS:
+    case DXGI_FORMAT_D32_FLOAT:             return DXGI_FORMAT_R32_FLOAT;
+    case DXGI_FORMAT_R32G8X24_TYPELESS:
+    case DXGI_FORMAT_D32_FLOAT_S8X24_UINT:  return DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS;
+    case DXGI_FORMAT_R24G8_TYPELESS:
+    case DXGI_FORMAT_D24_UNORM_S8_UINT:     return DXGI_FORMAT_R24_UNORM_X8_TYPELESS;
+    case DXGI_FORMAT_R16_TYPELESS:
+    case DXGI_FORMAT_D16_UNORM:             return DXGI_FORMAT_R16_UNORM;
     default: return fmt;
     }
 }
@@ -128,7 +135,7 @@ static void ResetForScale() {
     }
     for (auto& p : inputs) {
         p.netW = p.netH = 0;
-        p.fed.Reset(); p.packed.Reset(); p.localAnswer.Reset(); p.answerImage.Reset();
+        p.fed.Reset(); p.packed.Reset(); p.depthPacked.Reset(); p.localAnswer.Reset(); p.answerImage.Reset();
         p.scaleTex.Reset(); p.scaleRb.Reset();
         p.hdrMode = 0; p.hasExposure = p.autoExposure = p.isHdrFlag = false;
         p.preExposure = p.exposureScale = 1.0f;
@@ -163,11 +170,12 @@ static bool Prepare(Input& p, const AdapterFrameDesc& live) {
         p.composed = MakeTex(g_dev.Get(), UINT(color.Width), color.Height, compFmt, D3D12_RESOURCE_STATE_COMMON, true);
     }
     if (p.netW != kNetW || p.netH != kNetH) {
-        p.fed.Reset(); p.packed.Reset(); p.localAnswer.Reset(); p.answerImage.Reset();
+        p.fed.Reset(); p.packed.Reset(); p.depthPacked.Reset(); p.localAnswer.Reset(); p.answerImage.Reset();
         p.netW = kNetW; p.netH = kNetH;
     }
     if (!p.fed) p.fed = MakeTex(g_dev.Get(), kNetW, kNetH, DXGI_FORMAT_R16G16B16A16_FLOAT, D3D12_RESOURCE_STATE_COMMON, true);
     if (!p.packed) p.packed = MakeTex(g_dev.Get(), kNetW, kNetH, DXGI_FORMAT_R16G16_FLOAT, D3D12_RESOURCE_STATE_COMMON, true);
+    if (!p.depthPacked) p.depthPacked = MakeTex(g_dev.Get(), kNetW, kNetH, DXGI_FORMAT_R32_FLOAT, D3D12_RESOURCE_STATE_COMMON, true);
     if (!p.scaleTex) p.scaleTex = MakeTex(g_dev.Get(), 1, 1, DXGI_FORMAT_R32G32B32A32_FLOAT, D3D12_RESOURCE_STATE_COMMON, true);
     if (!p.scaleRb)  p.scaleRb = MakeReadback(D3D12_TEXTURE_DATA_PITCH_ALIGNMENT);
     if (!commitTex[0]) commitTex[0] = MakeTex(g_dev.Get(), 1, 1, DXGI_FORMAT_R32G32B32A32_FLOAT, D3D12_RESOURCE_STATE_COMMON, true);
@@ -180,7 +188,7 @@ static bool Prepare(Input& p, const AdapterFrameDesc& live) {
     }
     if (g_bypass && !p.answerImage) p.answerImage = MakeTex(g_dev.Get(), kNetW, kNetH, DXGI_FORMAT_R16G16B16A16_FLOAT,
                                                             D3D12_RESOURCE_STATE_COMMON, false);
-    if (!p.fed || !p.packed || !p.localAnswer || !p.composed || !p.scaleTex ||
+    if (!p.fed || !p.packed || !p.depthPacked || !p.localAnswer || !p.composed || !p.scaleTex ||
         !commitTex[0] || !commitTex[1] || !dummyExposure || (g_bypass && !p.answerImage)) return false;
     if (!p.heap) {
         D3D12_DESCRIPTOR_HEAP_DESC hd{}; hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
@@ -194,14 +202,17 @@ static bool Prepare(Input& p, const AdapterFrameDesc& live) {
     p.preExposure = (d.preExposure > 1e-4f) ? d.preExposure : 1.0f;
     p.exposureScale = (d.exposureScale > 1e-4f) ? d.exposureScale : 1.0f;
 
-    p.rs = g_rs; p.capturePso[0] = g_psoDown; p.capturePso[1] = g_psoMvPack;
+    p.rs = g_rs; p.capturePso[0] = g_psoDown; p.capturePso[1] = g_psoMvPack; p.capturePso[2] = g_psoDepthPack;
     Srv(p, Base, p.captured[0].Get()); Srv(p, Mv, p.captured[1].Get()); Srv(p, Fed, p.fed.Get());
     Srv(p, ComposeSrc, p.composed.Get());
     if (p.answerImage) Srv(p, AnswerImage, p.answerImage.Get());
     Srv(p, Exposure, p.hasExposure ? p.captured[3].Get() : dummyExposure.Get());
     Srv(p, ScaleSrv, p.scaleTex.Get());
+    if (p.captured[2] && !(p.captured[2]->GetDesc().Flags & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE))
+        Srv(p, Depth, p.captured[2].Get());
     Uav(p, FedUav, p.fed.Get()); Uav(p, MvUav, p.packed.Get()); Uav(p, ComposeUav, p.composed.Get());
     Uav(p, ScaleUav, p.scaleTex.Get());
+    Uav(p, DepthUav, p.depthPacked.Get());
     D3D12_SHADER_RESOURCE_VIEW_DESC sd{};
     sd.Format = DXGI_FORMAT_R16G16B16A16_FLOAT; sd.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
     sd.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
@@ -299,12 +310,25 @@ static bool Capture(ID3D12GraphicsCommandList* cl, const AdapterFrameDesc& d,
     }
     Barrier(cl, base, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
     Barrier(cl, mv, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
+    auto* dep = p.captured[2].Get();
+    auto* depPacked = p.depthPacked.Get();
+    const bool packDepth = (p.capturePso[2] != nullptr && dep && depPacked &&
+                            !(dep->GetDesc().Flags & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE));
+    if (packDepth) {
+        Barrier(cl, dep, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        Barrier(cl, depPacked, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        SetPass(cl, p.capturePso[2].Get(), Depth, Depth, Depth, Base, LocalAnswer, DepthUav, DepthUav,
+                kNetW, kNetH, p.heap.Get(), p.rs.Get(), false, 0u);
+        Barrier(cl, dep, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
+        Barrier(cl, depPacked, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    }
     Barrier(cl, fed, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
     Barrier(cl, packed, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
     const F9Id::A3Meta audit{int(raw - A2In::slots), -1, -1, raw->seq, 0};
     f9.Tap(F9Id::AColor, fed, key.frame, key.frame, F9Id::A2Pair, audit);
     f9.Tap(F9Id::AMv, packed, key.frame, key.frame, F9Id::A2Pair, audit);
-    capture.Seal(fed, packed);
+    capture.Seal(fed, packed, packDepth ? depPacked : nullptr);
+    if (packDepth) Barrier(cl, depPacked, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON);
     Barrier(cl, fed, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON);
     Barrier(cl, packed, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON);
     BtTrace("A3_A_INPUT", key.frame, "a3", "gen=%d epoch=%llu islot=%d iseq=%llu aslot=-1 aseq=0",

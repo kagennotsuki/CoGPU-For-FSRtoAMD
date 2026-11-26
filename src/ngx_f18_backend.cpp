@@ -122,9 +122,12 @@ static struct {
     PFN_Release Release = nullptr;
     PFN_Shutdown1 Shutdown1 = nullptr;
 
+    static constexpr unsigned kMaxSlots = 8u;
     ID3D12Device* dev = nullptr;
     NgxParam* params = nullptr;
-    void* handle = nullptr;
+    void* handles[kMaxSlots] = {};
+    bool slotResetPending[kMaxSlots] = {};
+    unsigned handleCount = 0u;
     ID3D12Resource* out = nullptr;     // answer texture (UAV)
     unsigned w = 0, h = 0;
     DXGI_FORMAT fmt = DXGI_FORMAT_UNKNOWN;
@@ -245,15 +248,28 @@ extern "C" bool NgxBackendLoad(ID3D12Device* dev) {
 }
 
 // cl must be an OPEN command list (CreateFeature takes the device from it)
-extern "C" bool NgxBackendEnsure(ID3D12GraphicsCommandList* cl, unsigned w, unsigned h, DXGI_FORMAT fmt) {
+extern "C" bool NgxBackendEnsure(ID3D12GraphicsCommandList* cl, unsigned w, unsigned h,
+                                 DXGI_FORMAT fmt, unsigned slotCount = 1u) {
     if (!g_nb.ok) return false;
-    if (g_nb.handle && g_nb.w == w && g_nb.h == h && g_nb.fmt == fmt) return true;
-    if (g_nb.handle && (g_nb.w != w || g_nb.h != h || g_nb.fmt != fmt)) {
-        if (g_nb.Release) g_nb.Release(g_nb.handle);
-        g_nb.handle = nullptr;
+    slotCount = (slotCount < 1u) ? 1u : ((slotCount > g_nb.kMaxSlots) ? g_nb.kMaxSlots : slotCount);
+    const bool dimOrFmtChanged = (g_nb.w != w || g_nb.h != h || g_nb.fmt != fmt);
+    if (!dimOrFmtChanged && g_nb.out && slotCount <= g_nb.handleCount) {
+        bool allOk = true;
+        for (unsigned i = 0; i < slotCount; ++i) {
+            if (!g_nb.handles[i]) { allOk = false; break; }
+        }
+        if (allOk) return true;
+    }
+    if (dimOrFmtChanged) {
+        for (unsigned i = 0; i < g_nb.kMaxSlots; ++i) {
+            if (g_nb.handles[i] && g_nb.Release) g_nb.Release(g_nb.handles[i]);
+            g_nb.handles[i] = nullptr;
+            g_nb.slotResetPending[i] = true;
+        }
+        g_nb.handleCount = 0u;
         if (g_nb.out) { g_nb.out->Release(); g_nb.out = nullptr; }
         g_nb.fmt = DXGI_FORMAT_UNKNOWN;
-        NgxLog("format/size changed -> rebuild feature (%ux%u fmt=%d)", w, h, (int)fmt);
+        NgxLog("format/size changed -> rebuild features (%ux%u fmt=%d slots=%u)", w, h, (int)fmt, slotCount);
     }
     if (!g_nb.out) {
         g_nb.out = NgxMakeAnswerTex(g_nb.dev, w, h, fmt);
@@ -270,29 +286,45 @@ extern "C" bool NgxBackendEnsure(ID3D12GraphicsCommandList* cl, unsigned w, unsi
     NbSetU(P, "DLSSNR.UICorrection", 1u);
     NbApplyStyleControls(P);
 
-    void* hnd = nullptr;
-    const int rc = g_nb.Create(cl, 18, g_nb.params, &hnd);
-    NgxLog("CreateFeature(18) -> 0x%X handle=%p (%ux%u fmt=%d)", (unsigned)rc, hnd, w, h, (int)fmt);
-    if (rc != NGX_OK || !hnd) { g_nb.ok = false; return false; }
-    g_nb.handle = hnd;
+    for (unsigned i = 0; i < slotCount; ++i) {
+        if (g_nb.handles[i]) continue;
+        void* hnd = nullptr;
+        const int rc = g_nb.Create(cl, 18, g_nb.params, &hnd);
+        NgxLog("CreateFeature(18) slot=%u -> 0x%X handle=%p (%ux%u fmt=%d)",
+               i, (unsigned)rc, hnd, w, h, (int)fmt);
+        if (rc != NGX_OK || !hnd) { g_nb.ok = false; return false; }
+        g_nb.handles[i] = hnd;
+        g_nb.slotResetPending[i] = true;
+    }
+    if (slotCount > g_nb.handleCount) g_nb.handleCount = slotCount;
     g_nb.w = w; g_nb.h = h; g_nb.fmt = fmt;
     return true;
 }
 
 // Called every frame. Records into cl only; submission stays with the caller.
-// mv may be null (= no motion vectors). Scales are UV ratios, same unit our residual
+// mv/depth may be null. Scales are UV ratios, same unit our residual
 // reprojection uses, so the core's own verdict (motion: OK / SUSPICIOUS / BAD) can tune them.
 extern "C" bool NgxBackendEval(ID3D12GraphicsCommandList* cl, ID3D12Resource* color, ID3D12Resource* mv,
-                               unsigned w, unsigned h, bool reset, float mvScaleX, float mvScaleY) {
-    if (!g_nb.ok || !g_nb.handle || !cl || !color) return false;
+                               ID3D12Resource* depth, unsigned w, unsigned h, bool reset,
+                               bool depthInverted, float mvScaleX, float mvScaleY, unsigned slotIndex = 0u) {
+    if (!g_nb.ok || !cl || !color) return false;
+    if (slotIndex >= g_nb.kMaxSlots || !g_nb.handles[slotIndex]) slotIndex = 0u;
+    void* activeHandle = g_nb.handles[slotIndex];
+    if (!activeHandle) return false;
+    if (reset) {
+        for (unsigned i = 0; i < g_nb.kMaxSlots; ++i) g_nb.slotResetPending[i] = true;
+    }
+    const bool useReset = g_nb.slotResetPending[slotIndex];
+    g_nb.slotResetPending[slotIndex] = false;
+
     NgxParam* P = g_nb.params;
     NbSetR(P, "DLSSNR.Color", color);
     NbSetR(P, "DLSSNR.Output", g_nb.out);
     NbSetU(P, "DLSSNR.Enabled", 1u);
     NbSetU(P, "DLSSNR.Width", w);
     NbSetU(P, "DLSSNR.Height", h);
-    NbSetU(P, "DLSSNR.DepthInverted", 0u);
-    NbSetU(P, "DLSSNR.Reset", reset ? 1u : 0u);
+    NbSetU(P, "DLSSNR.DepthInverted", depthInverted ? 1u : 0u);
+    NbSetU(P, "DLSSNR.Reset", useReset ? 1u : 0u);
     // colour / output: whole allocation (origin must be zero)
     NbSetU(P, "DLSSNR.ColorSubrectBaseX", 0u);
     NbSetU(P, "DLSSNR.ColorSubrectBaseY", 0u);
@@ -302,11 +334,17 @@ extern "C" bool NgxBackendEval(ID3D12GraphicsCommandList* cl, ID3D12Resource* co
     NbSetU(P, "DLSSNR.OutputSubrectBaseY", 0u);
     NbSetU(P, "DLSSNR.OutputSubrectWidth", w);
     NbSetU(P, "DLSSNR.OutputSubrectHeight", h);
-    // depth: network takes no depth; dlssnr_core reads it only for the motion-vector lookup when Motion Without Depth=0 (default 1) -> not fed
+    // depth: whole allocation when present (single-pass MV lookup & Interleaved disocclusion)
     NbSetU(P, "DLSSNR.DepthSubrectBaseX", 0u);
     NbSetU(P, "DLSSNR.DepthSubrectBaseY", 0u);
-    NbSetU(P, "DLSSNR.DepthSubrectWidth", 0u);
-    NbSetU(P, "DLSSNR.DepthSubrectHeight", 0u);
+    if (depth) {
+        NbSetR(P, "DLSSNR.Depth", depth);
+        NbSetU(P, "DLSSNR.DepthSubrectWidth", w);
+        NbSetU(P, "DLSSNR.DepthSubrectHeight", h);
+    } else {
+        NbSetU(P, "DLSSNR.DepthSubrectWidth", 0u);
+        NbSetU(P, "DLSSNR.DepthSubrectHeight", 0u);
+    }
     // motion vectors: whole allocation when present
     NbSetU(P, "DLSSNR.MVecSubrectBaseX", 0u);
     NbSetU(P, "DLSSNR.MVecSubrectBaseY", 0u);
@@ -327,9 +365,17 @@ extern "C" bool NgxBackendEval(ID3D12GraphicsCommandList* cl, ID3D12Resource* co
         const int now = mv ? 1 : 0;
         if (saidMv != now) { saidMv = now; NgxLog("MV: %s (scale=%.6f)", mv ? "fed" : "not fed", mv ? mvScaleX : 0.0f); }
     }
+    {
+        static int saidDep = -1;
+        const int nowDep = depth ? (depthInverted ? 2 : 1) : 0;
+        if (saidDep != nowDep) {
+            saidDep = nowDep;
+            NgxLog("Depth: %s (inverted=%u)", depth ? "fed" : "not fed", depthInverted ? 1u : 0u);
+        }
+    }
     NbApplyStyleControls(P);
 
-    const int rc = g_nb.Eval(cl, g_nb.handle, g_nb.params, nullptr);
+    const int rc = g_nb.Eval(cl, activeHandle, g_nb.params, nullptr);
     static int bad = 0;
     if (rc != NGX_OK) {
         if ((bad++ % 60) == 0) NgxLog("EvaluateFeature -> 0x%X (failure #%d)", (unsigned)rc, bad);
@@ -362,11 +408,15 @@ extern "C" void NgxBackendSetControls(float intensity, unsigned style, float loc
 
 extern "C" void* NgxBackendOutput() { return (void*)g_nb.out; }
 extern "C" DXGI_FORMAT NgxBackendFormat() { return g_nb.fmt; }
-extern "C" bool  NgxBackendActive() { return g_nb.ok && g_nb.handle != nullptr; }
+extern "C" bool  NgxBackendActive() { return g_nb.ok && g_nb.handleCount > 0u && g_nb.handles[0] != nullptr; }
 
 extern "C" void NgxBackendShutdown() {
-    if (g_nb.handle && g_nb.Release) g_nb.Release(g_nb.handle);
-    g_nb.handle = nullptr;
+    for (unsigned i = 0; i < g_nb.kMaxSlots; ++i) {
+        if (g_nb.handles[i] && g_nb.Release) g_nb.Release(g_nb.handles[i]);
+        g_nb.handles[i] = nullptr;
+        g_nb.slotResetPending[i] = false;
+    }
+    g_nb.handleCount = 0u;
     if (g_nb.Shutdown1 && g_nb.dev) g_nb.Shutdown1(g_nb.dev);
     g_nb.out = nullptr;
     g_nb.ok = false;

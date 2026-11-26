@@ -27,12 +27,12 @@
   - **B 形态（由【神经卡】负责呈现最终画面 · 4K 后置 DComp 覆盖 + 直连抓帧）**：主 SwapChain 提交前直连抓取 `PRESENT` 后缓冲送副卡完成合成，最终画面由神经卡经独立 DComp 透明覆盖层呈现（`Del` 菜单顶部实时显示当前运行形态与呈现显卡，支持一键切换）。
 - **可热切换 NR 推理分辨率倍率（NR Scale · 移植自 mochizuki）**：
   - 支持在 `Del` 菜单内直接切换 `固定 1080p`、`50% / 67% / 75% / 100% 渲染分辨率`、`固定 720p / 900p / 1440p / 4K (3840x2160)` 共 9 档（默认保持经典 `1080p`），自动安全排空双卡队列并重建跨卡共享资源与 0.0.9 会话（`F7 / F8` 跑马灯与三横带诊断已在 A/B 双形态统一关闭）。
-- **GPU 预处理实装（`[Preprocess]`）**：
-  - 在 `DownCS` / `kBformDS` 计算着色器内直接支持预处理总开关、曝光增益（EV Bias）、色调曲线（`none / neutral / reinhard / filmic / gt / aces / agx`）、中灰对比度与饱和度调节，并同步 `dlssnr-amd.ini` 与 `xess_proxy.saved.ini`。
+- **GPU 预处理闭环实装（`[Preprocess]`）**：
+  - 在 `DownCS` / `kBformDS` 与 `ResidCS` / `kBformResid` 计算着色器内直接实现前向/逆向预处理闭环，支持预处理总开关、逆色调映射开关（`Inverse`）、曝光模式/EV 补偿、色调曲线（`none / neutral / reinhard / filmic / gt / aces / agx`）、中灰对比度与饱和度调节（HDR 采用 `PrepSafeRatio` + `log2` 亮度/色度限幅 + BT.2020 宽色域零偏恒等保护），并双向同步 `dlssnr-amd.ini` 与 `xess_proxy.saved.ini`。
 - **完整 HDR10 PQ / scRGB 管线支持（A & B 双形态）**：
   - 支持游戏内 `HDR10 PQ` (`R10G10B10A2_UNORM` / ST.2084) 与 `scRGB` (`RGBA16F`) 自动识别、线性归一化喂图及双形态无损彩色/高亮峰值还原。
-- **多遍快速叠层 (`Passes fast` · 移植自 `DLSSNR-AMD v0.0.9`)**：
-  - 在神经卡单次 `dlssnr_core` 推理下等效 `2 ~ 8` 遍 DLSS5 叠层：支持 `Interleaved`（跨帧 N 槽位交错积累 + 6 级 Push-Pull 补洞 + 中性核心接管）、`Extrapolation`、`Feedback`、`Hybrid` 与 `Edit strength` 共 5 种模式（开启时核心统一使用 `RGBA16F`，A/B 双形态与 SDR/HDR 全共用）。
+- **多遍快速叠层与深度全链路接入 (`Passes fast` · `DLSSNR-AMD v0.0.9`)**：
+  - 在神经卡单次 `dlssnr_core` 推理下等效 `2 ~ 8` 遍 DLSS5 叠层：支持 `Interleaved`（每槽位独立 NGX 历史句柄、完整 `R32F` 深度打包接入 `DLSSNR.Depth` 与 Depth 3 件套抗重影、6 级 Push-Pull 与末帧直出保护）、`Extrapolation`、`Feedback`、`Hybrid` 与 `Edit strength` 共 5 种模式（开启时核心统一使用 `RGBA16F`，A/B 双形态与 SDR/HDR 全共用）。
 - **完整菜单控制与配置持久化（快捷键 `Del`）**：
   - 0.0.9 网络模型热切换（`CC_SMALL_FP8_EXPERIMENTAL` / `CC_SMALL_FP8` / `CC_SILVER_AARDWOLD_OPTIMIZED` / `CC_SILVER_AARDWOLD`）、优化档位、16/32-bit 历史精度、Style Grade、NR Scale、Intensity/Style/LocalTone/LocalStruct/SkinStruct 控制与保存/撤销/恢复默认按钮。
 
@@ -123,9 +123,9 @@ powershell -ExecutionPolicy Bypass -File .\scripts\build_ffx_proxy.ps1
 
 | 文件 | 大小 (Bytes) | SHA256 |
 |---|---:|---|
-| `prebuilt/OptiScaler/plugins/cogpu_nr.asi` | `1,228,800` | `C506C71C6868AC93BB796F14C789201032E3B720197A9B3632088930AC6E42D8` |
+| `prebuilt/OptiScaler/plugins/cogpu_nr.asi` | `1,263,104` | `F6471EC8DF232C23FB47294B04B6BCC69B821E49F964EF66F573DCA8739D6418` |
 | `prebuilt/dlssnr_core.dll` | `6,035,547` | `89CBA727B4440EA99F74354DB866285C3498044DFB43EF8E905EF4ECAF617642` |
-| `prebuilt/standalone_ffx_proxy/amd_fidelityfx_upscaler_dx12.dll` | `1,197,568` | `A9D04C2FBB0C40FDE582BCE194C0517C784C7193D7B1F7EE3B5CA108D24A43CB` |
+| `prebuilt/standalone_ffx_proxy/amd_fidelityfx_upscaler_dx12.dll` | `1,231,360` | `7484B17E583C7FC2AE63E296E559AD9081C1DFD0E2F02271553159B5C46460D9` |
 
 ---
 
