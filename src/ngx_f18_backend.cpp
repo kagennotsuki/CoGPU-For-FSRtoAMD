@@ -176,10 +176,12 @@ static float NbClampControl(float v, float lo, float hi, float def) {
     return def;
 }
 
-static void NbApplyStyleControls(NgxParam* p) {
+static void NbApplyStyleControls(NgxParam* p, unsigned slotIndex = 0u) {
     NbSetF(p, "DLSSNR.Intensity", g_nb.neutralOverride ? 1.0f : g_nb.intensity);
     NbSetU(p, "DLSSNR.Style", g_nb.neutralOverride ? 0u : g_nb.style);
-    NbSetF(p, "DLSSNR.LocalToneStrength", g_nb.localTone);
+    // Multi-pass stacking (Interleaved slot >= 1): follow DLSSNR-AMD/OptiScaler PassTuning where
+    // LocalTone defaults to 0 on passes 2+ so repeated local tone compression does not wash out contrast/color.
+    NbSetF(p, "DLSSNR.LocalToneStrength", (slotIndex == 0u) ? g_nb.localTone : 0.0f);
     NbSetF(p, "DLSSNR.LocalStructureStrength", g_nb.localStruct);
     NbSetF(p, "DLSSNR.SkinStructureStrength", g_nb.skinStruct);
     NbSetU(p, "DLSSNR.UseAutoMask", g_nb.useAutoMask);
@@ -284,10 +286,10 @@ extern "C" bool NgxBackendEnsure(ID3D12GraphicsCommandList* cl, unsigned w, unsi
     NbSetU(P, "VisibilityNodeMask", 1u);
     NbSetU(P, "DLSSNR.Hint.Render.Preset", 0u);
     NbSetU(P, "DLSSNR.UICorrection", 1u);
-    NbApplyStyleControls(P);
 
     for (unsigned i = 0; i < slotCount; ++i) {
         if (g_nb.handles[i]) continue;
+        NbApplyStyleControls(P, i);
         void* hnd = nullptr;
         const int rc = g_nb.Create(cl, 18, g_nb.params, &hnd);
         NgxLog("CreateFeature(18) slot=%u -> 0x%X handle=%p (%ux%u fmt=%d)",
@@ -373,7 +375,7 @@ extern "C" bool NgxBackendEval(ID3D12GraphicsCommandList* cl, ID3D12Resource* co
             NgxLog("Depth: %s (inverted=%u)", depth ? "fed" : "not fed", depthInverted ? 1u : 0u);
         }
     }
-    NbApplyStyleControls(P);
+    NbApplyStyleControls(P, slotIndex);
 
     const int rc = g_nb.Eval(cl, activeHandle, g_nb.params, nullptr);
     static int bad = 0;

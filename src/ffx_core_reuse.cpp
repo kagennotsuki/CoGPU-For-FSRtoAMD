@@ -4354,8 +4354,8 @@ void ResidCS(uint3 id : SV_DispatchThreadID)
             if (hdrMode == 0) {
                 if (gEdge > 0.5) {
                     float3 cLin = PpSrgbDec(CleanRgb(c.rgb));
-                    float3 dLin = PpResolveDelta(SrgbDec(a.rgb), SrgbDec(f.rgb), cLin,
-                                                 gVarGain, gMvConf, gMvIdx, gGateK, gConfIdx, -1.0);
+                    float3 dLin = PpResolveHdrDelta(SrgbDec(a.rgb), SrgbDec(f.rgb), cLin,
+                                                    gVarGain, gMvConf, gMvIdx, gGateK, gConfIdx, -1.0, gAlpha);
                     gDst[id.xy] = float4(PpSrgbEnc(max(cLin + dLin, 0.0)), c.a);
                     return;
                 }
@@ -4416,8 +4416,8 @@ void ResidCS(uint3 id : SV_DispatchThreadID)
         } else {
             if (gEdge > 0.5) {
                 float3 cLin = PpSrgbDec(CleanRgb(c.rgb));
-                float3 dLin = PpResolveDelta(PpSrgbDec(a.rgb), PpSrgbDec(f.rgb), cLin,
-                                             gVarGain, gMvConf, gMvIdx, gGateK, gConfIdx, -1.0);
+                float3 dLin = PpResolveHdrDelta(PpSrgbDec(a.rgb), PpSrgbDec(f.rgb), cLin,
+                                                gVarGain, gMvConf, gMvIdx, gGateK, gConfIdx, -1.0, gAlpha);
                 gDst[id.xy] = float4(PpSrgbEnc(max(cLin + dLin, 0.0)), c.a);
                 return;
             }
@@ -5875,8 +5875,8 @@ void main(uint3 id : SV_DispatchThreadID)
 
     if (gGateIdx > 0.5 && gLowCut <= 0.5 && gMode <= 0.5) {
         float3 cLin = PpSrgbDec(c.rgb);
-        float3 dLin = PpResolveDelta(BrSrgbDec(a), BrSrgbDec(f), cLin,
-                                     gPad2, gMvConf, gMvIdx, gGateK, gConfIdx, -1.0);
+        float3 dLin = PpResolveHdrDelta(BrSrgbDec(a), BrSrgbDec(f), cLin,
+                                        gPad2, gMvConf, gMvIdx, gGateK, gConfIdx, -1.0, gAlpha);
         gDst[id.xy] = float4(PpSrgbEnc(max(cLin + dLin, 0.0)), c.a);
         return;
     }
@@ -6508,6 +6508,7 @@ static double BlkDiff(const unsigned char* a, UINT pa, const unsigned char* b, U
 
 // 把 4 块 16×16 拷进回读缓冲（挂在 worker 自己的 list 上，WaitW 之后才读）
 static bool g_diagPending = false;
+static DXGI_FORMAT g_diagFmt[6] = {};
 static void BformDiagEnqueue(Worker& W, ID3D12Resource* ans, int slot, bool upWritten) {
     static int tick = 0;
     if (!g_bformOn || g_bHdrMode != 0) return;
@@ -6519,14 +6520,20 @@ static void BformDiagEnqueue(Worker& W, ID3D12Resource* ans, int slot, bool upWr
     }
     if (!BformDiagEnsure(W.dev.Get()) || !g_diagRb) { Log("DIAG4: 回读缓冲创建失败"); return; }
     ID3D12GraphicsCommandList* cl = W.cl.Get();
-    auto blk = [&](ID3D12Resource* tex, DXGI_FORMAT fmt, UINT sx, UINT sy, UINT64 off, D3D12_RESOURCE_STATES st) {
+    for (int i = 0; i < 6; ++i) g_diagFmt[i] = DXGI_FORMAT_UNKNOWN;
+    auto blk = [&](int bi, ID3D12Resource* tex, UINT sx, UINT sy, UINT64 off, D3D12_RESOURCE_STATES st) {
         if (!tex) return;
+        D3D12_RESOURCE_DESC td = tex->GetDesc();
+        const UINT bpp = FmtBytesCopyable(td.Format);
+        if (bpp != 4 && bpp != 8) return;
+        if (sx + kDiagBlk > (UINT)td.Width || sy + kDiagBlk > td.Height) return;
+        g_diagFmt[bi] = td.Format;
         Barrier(cl, tex, st, D3D12_RESOURCE_STATE_COPY_SOURCE);
         D3D12_TEXTURE_COPY_LOCATION d{};
         d.pResource = g_diagRb.Get();
         d.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
         d.PlacedFootprint.Offset = off;
-        d.PlacedFootprint.Footprint.Format = fmt;
+        d.PlacedFootprint.Footprint.Format = td.Format;
         d.PlacedFootprint.Footprint.Width = kDiagBlk;
         d.PlacedFootprint.Footprint.Height = kDiagBlk;
         d.PlacedFootprint.Footprint.Depth = 1;
@@ -6543,19 +6550,19 @@ static void BformDiagEnqueue(Worker& W, ID3D12Resource* ans, int slot, bool upWr
     const UINT sys = (kNetH  > kDiagBlk + 2) ? (kNetH  / 2 - kDiagBlk / 2) : 0;
     const UINT oxs = (g_outW > kDiagBlk + 2) ? (g_outW / 2 - kDiagBlk / 2) : 0;
     const UINT oys = (g_outH > kDiagBlk + 2) ? (g_outH / 2 - kDiagBlk / 2) : 0;
-    blk(g_bTexC.Get(),   g_upFmtC, nxs, nys, 0 * kDiagBlkBytes, D3D12_RESOURCE_STATE_COMMON);
-    blk(g_bComp[slot].Get(), DXGI_FORMAT_B8G8R8A8_UNORM, nxs, nys, 1 * kDiagBlkBytes, D3D12_RESOURCE_STATE_COMMON);
-    blk(g_bDs1080.Get(), DXGI_FORMAT_R8G8B8A8_UNORM, sxs, sys, 2 * kDiagBlkBytes, D3D12_RESOURCE_STATE_COMMON);
+    blk(0, g_bTexC.Get(),       nxs, nys, 0 * kDiagBlkBytes, D3D12_RESOURCE_STATE_COMMON);
+    blk(1, g_bComp[slot].Get(), nxs, nys, 1 * kDiagBlkBytes, D3D12_RESOURCE_STATE_COMMON);
+    blk(2, g_bDs1080.Get(),     sxs, sys, 2 * kDiagBlkBytes, D3D12_RESOURCE_STATE_COMMON);
     // ★ 2026-10-31：4K 后置模式不走上采样，g_bUp4k 停在 COMMON ——
     //   这里若按 NON_PIXEL_SHADER_RESOURCE 起跳就是非法转换（会掉设备），所以 4K 下跳过这一块。
     if (!g_bform4k && upWritten)
-        blk(g_bUp4k.Get(), g_upFmtC, oxs, oys, 3 * kDiagBlkBytes,
+        blk(3, g_bUp4k.Get(), oxs, oys, 3 * kDiagBlkBytes,
             g_backendNgx ? D3D12_RESOURCE_STATE_COMMON : D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-    // ★ 第 5 块直接取【本帧的答案纹理 po】：不再用 CPU 回读的那份（那份现在晚一轮）
-    if (ans) blk(ans, DXGI_FORMAT_R8G8B8A8_UNORM, sxs, sys, 4 * kDiagBlkBytes, D3D12_RESOURCE_STATE_COMMON);
+    // ★ 第 5 块直接取【本帧的答案纹理 po / FastOut】：按实际纹理格式拷入（Fast 开启时为 R16G16B16A16_FLOAT）
+    if (ans) blk(4, ans, sxs, sys, 4 * kDiagBlkBytes, D3D12_RESOURCE_STATE_COMMON);
     // ★ 第 6 块：TAA 的输出。用来判断 TAA 有没有真的在混历史（输出≈输入 = 空转）
     if (!g_backendNgx && g_taaOn && g_taaValid && g_taaOut)
-        blk(g_taaOut.Get(), g_upFmtC, oxs, oys, 5 * kDiagBlkBytes, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        blk(5, g_taaOut.Get(), oxs, oys, 5 * kDiagBlkBytes, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
     g_diagPending = true;
 }
 
@@ -6565,12 +6572,43 @@ static void BformDiagReadback(Worker& W) {
     D3D12_RANGE rr{ 0, 6 * kDiagBlkBytes };
     void* m = nullptr;
     if (FAILED(g_diagRb->Map(0, &rr, &m)) || !m) { Log("DIAG4: 回读 Map 失败"); return; }
-    const unsigned char* pN = (const unsigned char*)m + 0 * kDiagBlkBytes;
-    const unsigned char* pC = (const unsigned char*)m + 1 * kDiagBlkBytes;
-    const unsigned char* pF = (const unsigned char*)m + 2 * kDiagBlkBytes;
-    const unsigned char* pU = (const unsigned char*)m + 3 * kDiagBlkBytes;
-    const unsigned char* pA = (const unsigned char*)m + 4 * kDiagBlkBytes;   // 本帧答案（GPU 侧直接取）
-    const unsigned char* pT = (const unsigned char*)m + 5 * kDiagBlkBytes;   // TAA 输出（仅 bform=8 有效）
+    auto toRgba8 = [](const unsigned char* src, DXGI_FORMAT fmt, unsigned char* tmp) -> const unsigned char* {
+        if (fmt == DXGI_FORMAT_R16G16B16A16_FLOAT) {
+            for (UINT y = 0; y < kDiagBlk; ++y) {
+                const uint16_t* row = (const uint16_t*)(src + (size_t)y * kDiagPitch);
+                unsigned char* dst = tmp + (size_t)y * kDiagPitch;
+                for (UINT x = 0; x < kDiagBlk; ++x) {
+                    for (int c = 0; c < 4; ++c) {
+                        float v = HalfToFloat(row[(size_t)x * 4 + c]);
+                        if (!(v >= 0.0f)) v = 0.0f; else if (v > 1.0f) v = 1.0f;
+                        dst[(size_t)x * 4 + c] = (unsigned char)(v * 255.0f + 0.5f);
+                    }
+                }
+            }
+            return tmp;
+        }
+        if (fmt == DXGI_FORMAT_B8G8R8A8_UNORM) {
+            for (UINT y = 0; y < kDiagBlk; ++y) {
+                const unsigned char* row = src + (size_t)y * kDiagPitch;
+                unsigned char* dst = tmp + (size_t)y * kDiagPitch;
+                for (UINT x = 0; x < kDiagBlk; ++x) {
+                    dst[(size_t)x * 4 + 0] = row[(size_t)x * 4 + 2];
+                    dst[(size_t)x * 4 + 1] = row[(size_t)x * 4 + 1];
+                    dst[(size_t)x * 4 + 2] = row[(size_t)x * 4 + 0];
+                    dst[(size_t)x * 4 + 3] = row[(size_t)x * 4 + 3];
+                }
+            }
+            return tmp;
+        }
+        return src;
+    };
+    unsigned char tmp[6][kDiagBlk * kDiagPitch]{};
+    const unsigned char* pN = toRgba8((const unsigned char*)m + 0 * kDiagBlkBytes, g_diagFmt[0], tmp[0]);
+    const unsigned char* pC = toRgba8((const unsigned char*)m + 1 * kDiagBlkBytes, g_diagFmt[1], tmp[1]);
+    const unsigned char* pF = toRgba8((const unsigned char*)m + 2 * kDiagBlkBytes, g_diagFmt[2], tmp[2]);
+    const unsigned char* pU = toRgba8((const unsigned char*)m + 3 * kDiagBlkBytes, g_diagFmt[3], tmp[3]);
+    const unsigned char* pA = toRgba8((const unsigned char*)m + 4 * kDiagBlkBytes, g_diagFmt[4], tmp[4]);   // 本帧答案（GPU 侧直接取）
+    const unsigned char* pT = toRgba8((const unsigned char*)m + 5 * kDiagBlkBytes, g_diagFmt[5], tmp[5]);   // TAA 输出（仅 bform=8 有效）
 
     double mN = BlkMean(pN, kDiagPitch);
     double mC = BlkMean(pC, kDiagPitch);

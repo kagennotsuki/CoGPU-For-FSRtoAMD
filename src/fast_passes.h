@@ -1342,14 +1342,13 @@ public:
         const int eff = EffectiveMethod(s, hasMv);
         outEffMethod = eff;
 
-        if (reset || eff != lastPreMethod_ || (eff == kInterleaved && (uint32_t)std::clamp(s.ilPasses, 2, 8) != ilSlotsBuilt_)) {
-            if (reset || eff != lastPreMethod_) {
-                histValid_ = false;
-                ilValid_ = false;
-                ilDepthValid_ = false;
-                ilWarmMask_ = 0;
-                ilFrame_ = 0;
-            }
+        const bool ilSlotsChanged = (eff == kInterleaved && (uint32_t)std::clamp(s.ilPasses, 2, 8) != ilSlotsBuilt_);
+        if (reset || eff != lastPreMethod_ || ilSlotsChanged) {
+            histValid_ = false;
+            ilValid_ = false;
+            ilDepthValid_ = false;
+            ilWarmMask_ = 0;
+            ilFrame_ = 0;
         }
         lastPreMethod_ = eff;
         lastHasMv_ = hasMv;
